@@ -11,5 +11,8 @@ build/
 .conda_env/
 models/
 
+# Test output
+tests/output/
+
 # Large installer artifacts
 Miniconda*.sh

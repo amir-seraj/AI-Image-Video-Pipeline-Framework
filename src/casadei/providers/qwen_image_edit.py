@@ -56,10 +56,13 @@ class QwenImageEdit(ImageEditModel):
                 "diffusers with QwenImageEditPlusPipeline is required. "
                 "Install: pip install git+https://github.com/huggingface/diffusers"
             )
+
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         pipe = QwenImageEditPlusPipeline.from_pretrained(
-            self.MODEL_ID, torch_dtype=torch.bfloat16, cache_dir=MODELS_DIR
+            self.MODEL_ID, torch_dtype=torch_dtype, cache_dir=MODELS_DIR
         )
-        pipe.enable_sequential_cpu_offload()
+        if torch.cuda.is_available():
+            pipe = pipe.to("cuda")
         self._pipeline = pipe
 
     def unload_model(self) -> None:

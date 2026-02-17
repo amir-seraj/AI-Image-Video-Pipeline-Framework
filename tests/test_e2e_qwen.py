@@ -1,7 +1,7 @@
 """End-to-end test: real Qwen image editing through a pipeline.
 
 Requires:
-- CUDA GPU (uses sequential CPU offloading for 8GB cards)
+- CUDA GPU with bfloat16 support
 - Internet access on first run (to download Qwen/Qwen-Image-Edit-2511)
 
 Run with:
@@ -9,6 +9,7 @@ Run with:
 """
 
 import pytest
+import torch
 from pathlib import Path
 from PIL import Image as PILImage
 
@@ -24,7 +25,7 @@ from casadei import (
 from casadei.providers.qwen_image_edit import QwenImageEdit
 
 # Where to save results for visual inspection
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
+OUTPUT_DIR = Path(__file__).parent / "output"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -35,9 +36,13 @@ def setup_output_dir():
 @pytest.fixture(scope="module")
 def qwen_agent():
     """Load the real Qwen model once for all tests in this module."""
-    # Use fewer inference steps to keep runtime practical on 8GB GPUs
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available; skipping Qwen E2E test")
+
+    # Use moderate inference steps: 28 balances quality vs speed
+    # (10 is far too few for usable output; default 40 is ideal but slow)
     original_params = QwenImageEdit.DEFAULT_PARAMS.copy()
-    QwenImageEdit.DEFAULT_PARAMS["num_inference_steps"] = 10
+    QwenImageEdit.DEFAULT_PARAMS["num_inference_steps"] = 28
 
     agent = Agent(
         config=AgentConfig(
@@ -70,7 +75,7 @@ class TestQwenE2E:
                     input_map={"legs": "legs", "shoes": "shoes"},
                     output_map={"image": "result"},
                     template_kwargs={
-                        "prompt": "Replace the shoes on the model's feet with the shoes shown in the second image",
+                        "prompt": "In the first image there is a person wearing shoes. Replace the shoes on the person's feet with the shoes shown in the second image. Keep the person's pose, legs, clothing, and the background exactly the same.",
                     },
                 ),
             ],

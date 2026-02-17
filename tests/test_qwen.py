@@ -1,5 +1,6 @@
 # tests/test_qwen.py
 import pytest
+import torch
 from unittest.mock import MagicMock, patch
 from PIL import Image as PILImage
 
@@ -48,15 +49,19 @@ class TestQwenImageEditInference:
         model.load_model()
 
         mock_pipeline_cls.from_pretrained.assert_called_once()
-        mock_pipe.enable_sequential_cpu_offload.assert_called_once()
+        if torch.cuda.is_available():
+            mock_pipe.to.assert_called_once_with("cuda")
+        else:
+            mock_pipe.to.assert_not_called()
 
     @patch("casadei.providers.qwen_image_edit.QwenImageEditPlusPipeline")
     def test_edit_calls_pipeline(self, mock_pipeline_cls):
         fake_output_img = PILImage.new("RGB", (512, 512), color="green")
         mock_pipe = MagicMock()
         mock_pipe.return_value.images = [fake_output_img]
+        # .to("cuda") returns the same pipe object
+        mock_pipe.to.return_value = mock_pipe
         mock_pipeline_cls.from_pretrained.return_value = mock_pipe
-
 
         model = QwenImageEdit()
         model.load_model()
@@ -75,8 +80,8 @@ class TestQwenImageEditInference:
         fake_output_img = PILImage.new("RGB", (512, 512), color="blue")
         mock_pipe = MagicMock()
         mock_pipe.return_value.images = [fake_output_img]
+        mock_pipe.to.return_value = mock_pipe
         mock_pipeline_cls.from_pretrained.return_value = mock_pipe
-
 
         model = QwenImageEdit()
         model.load_model()

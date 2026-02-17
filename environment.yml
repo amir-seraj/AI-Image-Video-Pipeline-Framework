@@ -1,20 +1,23 @@
 name: casadei
-prefix: ./.conda_env
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
-  - python=3.13
-  - pytorch
-  - torchvision
-  - pytorch-cuda=12.4
+  - python=3.12
   - pip
   - pip:
+    - --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130
+    - --extra-index-url https://pypi.org/simple
+    - torch
+    - torchvision
+    - nvpl
     - pydantic>=2.0
     - pyyaml
     - pillow
+    - numpy
+    - transformers
+    - accelerate
+    - "imageio[ffmpeg]"
     - "diffusers @ git+https://github.com/huggingface/diffusers"
     - pytest
     - pytest-cov

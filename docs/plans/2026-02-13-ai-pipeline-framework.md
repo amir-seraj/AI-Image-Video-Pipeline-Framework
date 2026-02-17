@@ -6,9 +6,9 @@
 
 **Architecture:** A layered system: Media types (with template support) define data flowing through pipelines. Model classes form a hierarchy (AIModel → ImageEditModel → QwenImageEdit) encoding capabilities and constraints. Agents wrap model classes with specific configs and are serializable to YAML. Pipelines chain steps (agent, code, or sub-pipeline) via input/output mapping with shared context, and pipelines compose into larger pipelines. Execution logging tracks timing and metrics per step and per pipeline. Visualization renders pipeline structure as diagrams.
 
-**Tech Stack:** Python 3.13, conda (local env), Pydantic v2 (validation/serialization), PyYAML, Pillow, PyTorch + diffusers (model inference), pytest
+**Tech Stack:** Python 3.12, conda (local env), Pydantic v2 (validation/serialization), PyYAML, Pillow, PyTorch + diffusers (model inference), pytest
 
-**Hardware:** NVIDIA RTX 4060 (8GB VRAM) — bfloat16 required for model loading
+**Hardware:** NVIDIA Jetson AGX Thor (122GB unified memory) — bfloat16 required for model loading
 
 ---
 
@@ -58,22 +58,25 @@ build/
 
 ```yaml
 name: casadei
-prefix: ./.conda_env
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
-  - python=3.13
-  - pytorch
-  - torchvision
-  - pytorch-cuda=12.6
+  - python=3.12
   - pip
   - pip:
+    - --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130
+    - --extra-index-url https://pypi.org/simple
+    - torch
+    - torchvision
+    - nvpl
     - pydantic>=2.0
     - pyyaml
     - pillow
+    - numpy
+    - transformers
+    - accelerate
+    - "imageio[ffmpeg]"
     - "diffusers @ git+https://github.com/huggingface/diffusers"
     - pytest
     - pytest-cov
@@ -95,7 +98,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 name = "casadei"
 version = "0.1.0"
 description = "Flexible AI image/video pipeline framework"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.0",
     "pyyaml",

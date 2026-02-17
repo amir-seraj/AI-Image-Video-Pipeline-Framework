@@ -1,0 +1,9 @@
+name: image_to_video
+model: wan_i2v
+description: Generates video from a still image guided by a text prompt
+prompt_template: "$prompt"
+negative_prompt: "Bright tones, overexposed, static, blurred details, worst quality, low quality"
+params:
+  num_frames: 81
+  num_inference_steps: 50
+  guidance_scale: 5.0

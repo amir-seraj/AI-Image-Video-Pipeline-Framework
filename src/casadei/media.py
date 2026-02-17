@@ -8,7 +8,8 @@ from string import Template
 from typing import Any
 
 from PIL import Image as PILImage
-from pydantic import BaseModel, ConfigDict, field_validator
+import numpy as np
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class Media(BaseModel):
@@ -73,16 +74,59 @@ class TextMedia(Media):
 
 
 class VideoMedia(Media):
-    """A video referenced by file path."""
+    """A video stored as file path, in-memory frames, or both.
 
-    path: Path
+    At least one of ``path`` or ``frames`` must be provided.
+    Frames are numpy arrays of shape (H, W, 3) with uint8 dtype,
+    matching the output format of diffusers video pipelines.
+    """
 
-    @field_validator("path")
+    path: Path | None = None
+    frames: list[Any] | None = None
+    fps: int = 16
+    format: str = "mp4"
+
+    @model_validator(mode="after")
+    def _must_have_path_or_frames(self) -> VideoMedia:
+        if self.path is None and self.frames is None:
+            raise ValueError("VideoMedia requires at least one of 'path' or 'frames'")
+        if self.path is not None and not self.path.exists() and self.frames is None:
+            raise ValueError(f"Video path does not exist: {self.path}")
+        return self
+
+    @property
+    def frame_count(self) -> int:
+        if self.frames is not None:
+            return len(self.frames)
+        return 0
+
+    @property
+    def duration_seconds(self) -> float:
+        if self.frames is not None and self.fps > 0:
+            return len(self.frames) / self.fps
+        return 0.0
+
+    def save(self, path: Path) -> Path:
+        """Export in-memory frames to a video file."""
+        if self.frames is None:
+            raise ValueError("No in-memory frames to save")
+        from diffusers.utils import export_to_video
+        export_to_video(self.frames, str(path), fps=self.fps)
+        self.path = path
+        return path
+
     @classmethod
-    def path_must_exist(cls, v: Path) -> Path:
-        if not v.exists():
-            raise ValueError(f"Video path does not exist: {v}")
-        return v
+    def load(cls, path: Path, fps: int = 16) -> VideoMedia:
+        """Load a video file into in-memory frames."""
+        from diffusers.utils import load_video
+        frames_pil = load_video(str(path))
+        frames_np = [np.array(f) for f in frames_pil]
+        return cls(path=path, frames=frames_np, fps=fps)
+
+    @classmethod
+    def from_frames(cls, frames: list, fps: int = 16) -> VideoMedia:
+        """Create VideoMedia from a list of numpy array frames."""
+        return cls(frames=frames, fps=fps)
 
 
 class MediaBundle(Media):

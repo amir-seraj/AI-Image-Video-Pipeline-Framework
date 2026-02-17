@@ -1,0 +1,9 @@
+name: video_editor
+model: wan_video_edit
+description: Edits existing video guided by a text prompt
+prompt_template: "$prompt"
+negative_prompt: "Bright tones, overexposed, static, blurred details, worst quality, low quality"
+params:
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  strength: 0.7
