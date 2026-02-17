@@ -1,0 +1,8 @@
+name: object_replacer
+model: qwen_image_edit
+description: Replaces specific objects in an image with something else
+prompt_template: "Replace the $source_object with a $target_object, maintaining realistic lighting and perspective"
+negative_prompt: "unrealistic, floating, disconnected shadows"
+params:
+  num_inference_steps: 40
+  true_cfg_scale: 4.0

@@ -1,0 +1,20 @@
+name: casadei
+prefix: ./.conda_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.4
+  - pip
+  - pip:
+    - pydantic>=2.0
+    - pyyaml
+    - pillow
+    - "diffusers @ git+https://github.com/huggingface/diffusers"
+    - pytest
+    - pytest-cov

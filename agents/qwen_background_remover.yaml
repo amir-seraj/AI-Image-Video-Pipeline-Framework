@@ -1,0 +1,8 @@
+name: background_remover
+model: qwen_image_edit
+description: Removes backgrounds from images, isolating the main subject
+prompt_template: "Remove the background completely, leaving only the main subject on a $background_color background"
+negative_prompt: "blurry, artifacts, incomplete removal"
+params:
+  num_inference_steps: 40
+  true_cfg_scale: 4.0
