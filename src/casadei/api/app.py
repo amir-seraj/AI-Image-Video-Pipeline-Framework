@@ -1,0 +1,874 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import threading
+import uuid
+import yaml
+from pathlib import Path
+
+import fastapi
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from sse_starlette.sse import EventSourceResponse
+
+from .jobs import JobManager
+from .models import (
+    AgentConfigRequest,
+    AgentConfigResponse,
+    AgentInfo,
+    CreateProductRequest,
+    DuplicateAgentRequest,
+    GenerateRequest,
+    Generation,
+    JobStatus,
+    PipelineCreateRequest,
+    PipelineDetailResponse,
+    PipelinePreset,
+    PipelineStepRequest,
+    PipelineStepResponse,
+    PipelineUpdateRequest,
+    Product,
+    RefineRequest,
+    ResultFile,
+    RunResponse,
+    Sketch,
+)
+from .store import JsonStore
+
+_DEFAULT_DATA_DIR = Path("data")
+
+
+def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
+    app = FastAPI(title="Casadei API", version="0.1.0")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    store = JsonStore(data_dir / "store.json")
+    uploads_dir = data_dir / "uploads"
+    results_dir = data_dir / "results"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    job_manager = JobManager()
+
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    agents_dir = project_root / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    workflows_dir = project_root / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Product CRUD ---
+
+    @app.post("/api/products", status_code=201)
+    def create_product(req: CreateProductRequest) -> Product:
+        product = Product(name=req.name)
+        store.save_product(product)
+        return product
+
+    @app.get("/api/products")
+    def list_products_endpoint() -> list[Product]:
+        return store.list_products()
+
+    @app.get("/api/products/{product_id}")
+    def get_product(product_id: str) -> Product:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return product
+
+    @app.delete("/api/products/{product_id}", status_code=204)
+    def delete_product(product_id: str) -> None:
+        if not store.delete_product(product_id):
+            raise HTTPException(status_code=404, detail="Product not found")
+
+    # --- Sketch upload ---
+
+    @app.post("/api/products/{product_id}/sketches", status_code=201)
+    async def upload_sketch(product_id: str, file: UploadFile) -> Sketch:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        sketch = Sketch(filename=file.filename or "sketch.png")
+        sketch_dir = uploads_dir / product_id
+        sketch_dir.mkdir(parents=True, exist_ok=True)
+        dest = sketch_dir / f"{sketch.id}_{sketch.filename}"
+        dest.write_bytes(await file.read())
+
+        product.sketches.append(sketch)
+        store.save_product(product)
+        return sketch
+
+    @app.delete(
+        "/api/products/{product_id}/sketches/{sketch_id}", status_code=204
+    )
+    def delete_sketch(product_id: str, sketch_id: str) -> None:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        original_len = len(product.sketches)
+        product.sketches = [s for s in product.sketches if s.id != sketch_id]
+        if len(product.sketches) == original_len:
+            raise HTTPException(status_code=404, detail="Sketch not found")
+
+        sketch_dir = uploads_dir / product_id
+        for f in sketch_dir.glob(f"{sketch_id}_*"):
+            f.unlink()
+
+        store.save_product(product)
+
+    @app.get("/api/uploads/{product_id}/{filename}")
+    def serve_upload(product_id: str, filename: str) -> FileResponse:
+        path = uploads_dir / product_id / filename
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(path)
+
+    @app.get("/api/results/{filename:path}")
+    def serve_result(filename: str) -> FileResponse:
+        path = results_dir / filename
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(path)
+
+    # --- Agent & Pipeline info ---
+
+    @app.get("/api/agents")
+    def list_agents() -> list[AgentInfo]:
+        from casadei import load_agent
+
+        result = []
+        if agents_dir.exists():
+            for yaml_file in sorted(agents_dir.glob("*.yaml")):
+                config = load_agent(yaml_file)
+                variables = re.findall(
+                    r"\$\{?(\w+)\}?", config.prompt_template
+                )
+                result.append(
+                    AgentInfo(
+                        name=config.name,
+                        model=config.model,
+                        description=config.description,
+                        template_variables=variables,
+                    )
+                )
+        return result
+
+    @app.get("/api/agents/{agent_name}")
+    def get_agent(agent_name: str) -> AgentConfigResponse:
+        from casadei import load_agent
+
+        for yaml_file in agents_dir.glob("*.yaml"):
+            config = load_agent(yaml_file)
+            if config.name == agent_name:
+                variables = re.findall(r"\$\{?(\w+)\}?", config.prompt_template)
+                return AgentConfigResponse(
+                    name=config.name,
+                    model=config.model,
+                    description=config.description,
+                    prompt_template=config.prompt_template,
+                    negative_prompt=config.negative_prompt,
+                    params=config.params,
+                    template_variables=variables,
+                )
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    @app.post("/api/agents", status_code=201)
+    def create_agent(req: AgentConfigRequest) -> AgentConfigResponse:
+        from casadei.agent import AgentConfig, save_agent
+
+        dest = agents_dir / f"{req.name}.yaml"
+        if dest.exists():
+            raise HTTPException(status_code=409, detail="Agent already exists")
+
+        config = AgentConfig(
+            name=req.name,
+            model=req.model,
+            description=req.description,
+            prompt_template=req.prompt_template,
+            negative_prompt=req.negative_prompt,
+            params=req.params,
+        )
+        save_agent(config, dest)
+
+        variables = re.findall(r"\$\{?(\w+)\}?", config.prompt_template)
+        return AgentConfigResponse(
+            name=config.name,
+            model=config.model,
+            description=config.description,
+            prompt_template=config.prompt_template,
+            negative_prompt=config.negative_prompt,
+            params=config.params,
+            template_variables=variables,
+        )
+
+    @app.put("/api/agents/{agent_name}")
+    def update_agent(agent_name: str, req: AgentConfigRequest) -> AgentConfigResponse:
+        from casadei.agent import AgentConfig, save_agent, load_agent
+
+        found_path = None
+        for yaml_file in agents_dir.glob("*.yaml"):
+            config = load_agent(yaml_file)
+            if config.name == agent_name:
+                found_path = yaml_file
+                break
+
+        if not found_path:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        new_config = AgentConfig(
+            name=req.name,
+            model=req.model,
+            description=req.description,
+            prompt_template=req.prompt_template,
+            negative_prompt=req.negative_prompt,
+            params=req.params,
+        )
+
+        if req.name != agent_name:
+            found_path.unlink()
+            found_path = agents_dir / f"{req.name}.yaml"
+
+        save_agent(new_config, found_path)
+
+        variables = re.findall(r"\$\{?(\w+)\}?", new_config.prompt_template)
+        return AgentConfigResponse(
+            name=new_config.name,
+            model=new_config.model,
+            description=new_config.description,
+            prompt_template=new_config.prompt_template,
+            negative_prompt=new_config.negative_prompt,
+            params=new_config.params,
+            template_variables=variables,
+        )
+
+    @app.delete("/api/agents/{agent_name}", status_code=204)
+    def delete_agent(agent_name: str) -> None:
+        from casadei import load_agent
+
+        for yaml_file in agents_dir.glob("*.yaml"):
+            config = load_agent(yaml_file)
+            if config.name == agent_name:
+                yaml_file.unlink()
+                return
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    @app.post("/api/agents/{agent_name}/duplicate", status_code=201)
+    def duplicate_agent(agent_name: str, req: DuplicateAgentRequest) -> AgentConfigResponse:
+        from casadei.agent import AgentConfig, save_agent, load_agent
+
+        dest = agents_dir / f"{req.new_name}.yaml"
+        if dest.exists():
+            raise HTTPException(status_code=409, detail="Agent with that name already exists")
+
+        source_config = None
+        for yaml_file in agents_dir.glob("*.yaml"):
+            config = load_agent(yaml_file)
+            if config.name == agent_name:
+                source_config = config
+                break
+
+        if not source_config:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        new_config = AgentConfig(
+            name=req.new_name,
+            model=source_config.model,
+            description=source_config.description,
+            prompt_template=source_config.prompt_template,
+            negative_prompt=source_config.negative_prompt,
+            params=source_config.params,
+        )
+        save_agent(new_config, dest)
+
+        variables = re.findall(r"\$\{?(\w+)\}?", new_config.prompt_template)
+        return AgentConfigResponse(
+            name=new_config.name,
+            model=new_config.model,
+            description=new_config.description,
+            prompt_template=new_config.prompt_template,
+            negative_prompt=new_config.negative_prompt,
+            params=new_config.params,
+            template_variables=variables,
+        )
+
+    @app.get("/api/models")
+    def list_models() -> list[str]:
+        from casadei.models.registry import default_registry
+        return default_registry.list_models()
+
+    @app.get("/api/pipelines")
+    def list_pipelines() -> list[PipelinePreset]:
+        from casadei import load_agent as _load_agent
+
+        results = []
+        for pipeline_yaml in sorted(workflows_dir.glob("*/pipeline.yaml")):
+            with open(pipeline_yaml) as f:
+                data = yaml.safe_load(f)
+
+            template_vars: list[str] = []
+            pipeline_dir = pipeline_yaml.parent
+            for step in data.get("steps", []):
+                if step.get("type") == "agent":
+                    agent_name = step["agent"]
+                    local_yaml = pipeline_dir / "agents" / f"{agent_name}.yaml"
+                    config = None
+                    if local_yaml.exists():
+                        config = _load_agent(local_yaml)
+                    else:
+                        for gf in agents_dir.glob("*.yaml"):
+                            gc = _load_agent(gf)
+                            if gc.name == agent_name:
+                                config = gc
+                                break
+                    if config:
+                        step_vars = re.findall(r"\$\{?(\w+)\}?", config.prompt_template)
+                        for v in step_vars:
+                            if v not in template_vars:
+                                template_vars.append(v)
+
+            agent_names = [s["agent"] for s in data.get("steps", []) if s.get("type") == "agent"]
+
+            results.append(PipelinePreset(
+                id=data["id"],
+                name=data["name"],
+                description=data.get("description", ""),
+                agents=agent_names,
+                template_variables=template_vars,
+            ))
+        return results
+
+    @app.get("/api/pipelines/{pipeline_id}")
+    def get_pipeline(pipeline_id: str) -> PipelineDetailResponse:
+        from casadei import load_agent
+
+        pipeline_dir = workflows_dir / pipeline_id
+        pipeline_yaml = pipeline_dir / "pipeline.yaml"
+        if not pipeline_yaml.exists():
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+
+        with open(pipeline_yaml) as f:
+            data = yaml.safe_load(f)
+
+        steps = []
+        template_vars: list[str] = []
+        for step in data.get("steps", []):
+            if step["type"] == "agent":
+                agent_name = step["agent"]
+                local_yaml = pipeline_dir / "agents" / f"{agent_name}.yaml"
+                if local_yaml.exists():
+                    config = load_agent(local_yaml)
+                else:
+                    config = None
+                    for gf in agents_dir.glob("*.yaml"):
+                        gc = load_agent(gf)
+                        if gc.name == agent_name:
+                            config = gc
+                            break
+                if config:
+                    step_vars = re.findall(r"\$\{?(\w+)\}?", config.prompt_template)
+                    for v in step_vars:
+                        if v not in template_vars:
+                            template_vars.append(v)
+                steps.append(PipelineStepResponse(type="agent", agent=agent_name))
+            elif step["type"] == "code":
+                script_path = pipeline_dir / "scripts" / step["script"]
+                steps.append(PipelineStepResponse(
+                    type="code",
+                    script=step["script"],
+                    function=step.get("function"),
+                    exists=script_path.exists(),
+                ))
+
+        local_agents_dir = pipeline_dir / "agents"
+        local_agents = []
+        if local_agents_dir.exists():
+            for la in local_agents_dir.glob("*.yaml"):
+                config = load_agent(la)
+                local_agents.append(config.name)
+
+        return PipelineDetailResponse(
+            id=data["id"],
+            name=data["name"],
+            description=data.get("description", ""),
+            steps=steps,
+            local_agents=local_agents,
+            template_variables=template_vars,
+        )
+
+    @app.post("/api/pipelines", status_code=201)
+    def create_pipeline(req: PipelineCreateRequest) -> PipelineDetailResponse:
+        pipeline_dir = workflows_dir / req.id
+        if pipeline_dir.exists():
+            raise HTTPException(status_code=409, detail="Pipeline already exists")
+
+        pipeline_dir.mkdir(parents=True)
+
+        data = {
+            "id": req.id,
+            "name": req.name,
+            "description": req.description,
+            "steps": [s.model_dump(exclude_none=True) for s in req.steps],
+        }
+        with open(pipeline_dir / "pipeline.yaml", "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+        return get_pipeline(req.id)
+
+    @app.put("/api/pipelines/{pipeline_id}")
+    def update_pipeline(pipeline_id: str, req: PipelineUpdateRequest) -> PipelineDetailResponse:
+        pipeline_dir = workflows_dir / pipeline_id
+        pipeline_yaml = pipeline_dir / "pipeline.yaml"
+        if not pipeline_yaml.exists():
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+
+        with open(pipeline_yaml) as f:
+            data = yaml.safe_load(f)
+
+        if req.name is not None:
+            data["name"] = req.name
+        if req.description is not None:
+            data["description"] = req.description
+        if req.steps is not None:
+            data["steps"] = [s.model_dump(exclude_none=True) for s in req.steps]
+
+        with open(pipeline_yaml, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+        return get_pipeline(pipeline_id)
+
+    @app.delete("/api/pipelines/{pipeline_id}", status_code=204)
+    def delete_pipeline(pipeline_id: str) -> None:
+        import shutil
+        pipeline_dir = workflows_dir / pipeline_id
+        if not pipeline_dir.exists():
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        shutil.rmtree(pipeline_dir)
+
+    @app.post("/api/pipelines/{pipeline_id}/agents", status_code=201)
+    def create_pipeline_local_agent(
+        pipeline_id: str, req: AgentConfigRequest
+    ) -> AgentConfigResponse:
+        from casadei.agent import AgentConfig, save_agent
+
+        pipeline_dir = workflows_dir / pipeline_id
+        if not pipeline_dir.exists():
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+
+        local_agents_dir = pipeline_dir / "agents"
+        local_agents_dir.mkdir(exist_ok=True)
+
+        config = AgentConfig(
+            name=req.name,
+            model=req.model,
+            description=req.description,
+            prompt_template=req.prompt_template,
+            negative_prompt=req.negative_prompt,
+            params=req.params,
+        )
+        save_agent(config, local_agents_dir / f"{req.name}.yaml")
+
+        variables = re.findall(r"\$\{?(\w+)\}?", config.prompt_template)
+        return AgentConfigResponse(
+            name=config.name,
+            model=config.model,
+            description=config.description,
+            prompt_template=config.prompt_template,
+            negative_prompt=config.negative_prompt,
+            params=config.params,
+            template_variables=variables,
+        )
+
+    @app.delete("/api/pipelines/{pipeline_id}/agents/{agent_name}", status_code=204)
+    def delete_pipeline_local_agent(pipeline_id: str, agent_name: str) -> None:
+        pipeline_dir = workflows_dir / pipeline_id
+        local_yaml = pipeline_dir / "agents" / f"{agent_name}.yaml"
+        if not local_yaml.exists():
+            raise HTTPException(status_code=404, detail="Local agent not found")
+        local_yaml.unlink()
+
+    @app.post("/api/pipelines/{pipeline_id}/scripts/{filename}/open", status_code=200)
+    def open_pipeline_script(pipeline_id: str, filename: str) -> dict:
+        import subprocess
+        pipeline_dir = workflows_dir / pipeline_id
+        scripts_dir = pipeline_dir / "scripts"
+        scripts_dir.mkdir(exist_ok=True)
+        script_path = scripts_dir / filename
+
+        if not script_path.exists():
+            script_path.write_text(
+                f'"""Pipeline code step: {filename}"""\n\n'
+                f"from casadei.media import Media\n\n\n"
+                f"def process(context: dict[str, Media]) -> dict[str, Media]:\n"
+                f"    # TODO: implement\n"
+                f"    return context\n"
+            )
+
+        try:
+            subprocess.Popen(["xdg-open", str(script_path)])
+        except FileNotFoundError:
+            subprocess.Popen(["open", str(script_path)])
+
+        return {"opened": str(script_path)}
+
+    # --- Scratch run (workbench) ---
+
+    def _run_scratch(
+        run_id: str,
+        run_type: str,
+        name: str,
+        template_variables: dict[str, str],
+        image_path: Path,
+        job_id: str,
+    ) -> None:
+        """Background thread: runs a single agent or pipeline on a scratch image."""
+        try:
+            from casadei import Agent, ImageMedia, MediaBundle, TextMedia, load_agent
+
+            job_manager.update_progress(job_id, 0.05, "Loading image...")
+
+            source_image = ImageMedia.load(image_path)
+
+            agent_name_to_yaml: dict[str, Path] = {}
+            if agents_dir.exists():
+                for yaml_file in agents_dir.glob("*.yaml"):
+                    config = load_agent(yaml_file)
+                    agent_name_to_yaml[config.name] = yaml_file
+
+            if run_type == "agent":
+                agent_names = [name]
+            else:
+                preset = None
+                for p in list_pipelines():
+                    if p.id == name:
+                        preset = p
+                        break
+                if not preset:
+                    job_manager.fail(job_id, f"Unknown pipeline: {name}")
+                    return
+                agent_names = preset.agents
+
+            total = len(agent_names)
+            result_images = [source_image]
+
+            for i, agent_name in enumerate(agent_names):
+                progress = 0.1 + (0.8 * i / max(total, 1))
+                job_manager.update_progress(job_id, progress, f"Running {agent_name}...")
+
+                yaml_path = agent_name_to_yaml.get(agent_name)
+                if not yaml_path:
+                    job_manager.fail(job_id, f"Agent not found: {agent_name}")
+                    return
+
+                agent_config = load_agent(yaml_path)
+                agent = Agent(agent_config)
+                agent.load()
+
+                try:
+                    bundle_items: dict = {"image": result_images[0]}
+                    if len(result_images) > 1:
+                        bundle_items["image_2"] = result_images[1]
+
+                    template_kwargs = dict(template_variables)
+
+                    output = agent.execute(
+                        MediaBundle(items=bundle_items),
+                        **template_kwargs,
+                    )
+
+                    for _key, media in output.items.items():
+                        if isinstance(media, ImageMedia):
+                            result_images = [media]
+                finally:
+                    agent.unload()
+
+            job_manager.update_progress(job_id, 0.95, "Saving results...")
+            scratch_results_dir = results_dir / "scratch" / run_id
+            scratch_results_dir.mkdir(parents=True, exist_ok=True)
+
+            for idx, img in enumerate(result_images):
+                fname = f"output_{idx}.png"
+                img.save(scratch_results_dir / fname)
+
+            job_manager.complete(job_id)
+
+        except Exception as e:
+            job_manager.fail(job_id, str(e))
+
+    @app.post("/api/run", status_code=202)
+    async def run_workbench(
+        type: str = fastapi.Form(...),
+        name: str = fastapi.Form(...),
+        template_variables: str = fastapi.Form("{}"),
+        image: UploadFile = fastapi.File(...),
+    ) -> RunResponse:
+        if type not in ("agent", "pipeline"):
+            raise HTTPException(status_code=400, detail="type must be 'agent' or 'pipeline'")
+
+        try:
+            vars_dict = json.loads(template_variables)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="template_variables must be valid JSON")
+
+        run_id = uuid.uuid4().hex[:12]
+
+        scratch_dir = uploads_dir / "scratch" / run_id
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        image_path = scratch_dir / (image.filename or "input.png")
+        image_path.write_bytes(await image.read())
+
+        job_id = job_manager.create("scratch", run_id)
+
+        thread = threading.Thread(
+            target=_run_scratch,
+            args=(run_id, type, name, vars_dict, image_path, job_id),
+            daemon=True,
+        )
+        thread.start()
+
+        return RunResponse(job_id=job_id, run_id=run_id)
+
+    # --- Generation ---
+
+    def _run_generation(
+        product: Product,
+        generation: Generation,
+        job_id: str,
+    ) -> None:
+        """Background thread: runs the Casadei pipeline."""
+        try:
+            from casadei import (
+                Agent,
+                ImageMedia,
+                MediaBundle,
+                TextMedia,
+                load_agent,
+            )
+
+            job_manager.update_progress(job_id, 0.1, "Loading models...")
+
+            agent_name_to_yaml: dict[str, Path] = {}
+            if agents_dir.exists():
+                for yaml_file in agents_dir.glob("*.yaml"):
+                    config = load_agent(yaml_file)
+                    agent_name_to_yaml[config.name] = yaml_file
+
+            preset = None
+            for p in list_pipelines():
+                if p.id == generation.pipeline:
+                    preset = p
+                    break
+
+            if not preset:
+                job_manager.fail(
+                    job_id, f"Unknown pipeline: {generation.pipeline}"
+                )
+                return
+
+            sketch_dir = uploads_dir / product.id
+            images = []
+            for sketch in product.sketches:
+                for f in sketch_dir.glob(f"{sketch.id}_*"):
+                    images.append(ImageMedia.load(f))
+
+            if not images:
+                job_manager.fail(job_id, "No sketch images found")
+                return
+
+            total_agents = len(preset.agents)
+            result_images = images
+
+            for i, agent_name in enumerate(preset.agents):
+                progress = 0.1 + (0.8 * i / total_agents)
+                job_manager.update_progress(
+                    job_id, progress, f"Running {agent_name}..."
+                )
+
+                yaml_path = agent_name_to_yaml.get(agent_name)
+                if not yaml_path:
+                    job_manager.fail(
+                        job_id, f"Agent not found: {agent_name}"
+                    )
+                    return
+
+                agent_config = load_agent(yaml_path)
+                agent = Agent(agent_config)
+                agent.load()
+
+                try:
+                    bundle_items: dict = {"image": result_images[0]}
+                    if len(result_images) > 1:
+                        bundle_items["image_2"] = result_images[1]
+                    bundle_items["prompt"] = TextMedia(
+                        text=generation.prompt
+                    )
+                    if generation.negative_prompt:
+                        bundle_items["negative_prompt"] = TextMedia(
+                            text=generation.negative_prompt
+                        )
+
+                    template_kwargs = {
+                        "prompt": generation.prompt,
+                        "style": generation.prompt,
+                    }
+
+                    output = agent.execute(
+                        MediaBundle(items=bundle_items),
+                        **template_kwargs,
+                    )
+
+                    for _key, media in output.items.items():
+                        if isinstance(media, ImageMedia):
+                            result_images = [media]
+                finally:
+                    agent.unload()
+
+            job_manager.update_progress(job_id, 0.95, "Saving results...")
+            gen_results_dir = results_dir / product.id / generation.id
+            gen_results_dir.mkdir(parents=True, exist_ok=True)
+
+            result_files = []
+            for idx, img in enumerate(
+                result_images[: generation.num_outputs]
+            ):
+                fname = f"output_{idx}.png"
+                img.save(gen_results_dir / fname)
+                result_files.append(ResultFile(filename=fname))
+
+            generation.results = result_files
+            generation.status = JobStatus.completed
+            store.save_product(product)
+
+            job_manager.complete(job_id)
+
+        except Exception as e:
+            generation.status = JobStatus.failed
+            store.save_product(product)
+            job_manager.fail(job_id, str(e))
+
+    @app.post("/api/products/{product_id}/generate", status_code=202)
+    def start_generation(product_id: str, req: GenerateRequest) -> dict:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        if not product.sketches:
+            raise HTTPException(
+                status_code=400, detail="No sketches uploaded"
+            )
+
+        generation = Generation(
+            pipeline=req.pipeline,
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            num_outputs=req.num_outputs,
+            status=JobStatus.pending,
+        )
+        product.generations.append(generation)
+        store.save_product(product)
+
+        job_id = job_manager.create(product_id, generation.id)
+
+        thread = threading.Thread(
+            target=_run_generation,
+            args=(product, generation, job_id),
+            daemon=True,
+        )
+        thread.start()
+
+        return {"job_id": job_id, "generation_id": generation.id}
+
+    @app.get("/api/jobs/{job_id}")
+    def get_job(job_id: str) -> dict:
+        state = job_manager.get(job_id)
+        if not state:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {
+            "job_id": state.job_id,
+            "status": state.status,
+            "progress": state.progress,
+            "message": state.message,
+            "error": state.error,
+            "product_id": state.product_id,
+            "generation_id": state.generation_id,
+        }
+
+    @app.get("/api/jobs/{job_id}/stream")
+    async def stream_job(job_id: str):
+        state = job_manager.get(job_id)
+        if not state:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        async def event_generator():
+            event = job_manager.subscribe(job_id)
+            try:
+                while True:
+                    current = job_manager.get(job_id)
+                    if not current:
+                        break
+                    yield {
+                        "event": "progress",
+                        "data": json.dumps(
+                            {
+                                "status": current.status,
+                                "progress": current.progress,
+                                "message": current.message,
+                                "error": current.error,
+                            }
+                        ),
+                    }
+                    if current.status in ("completed", "failed"):
+                        break
+                    event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, event.wait
+                            ),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                job_manager.unsubscribe(job_id, event)
+
+        return EventSourceResponse(event_generator())
+
+    # --- Refine ---
+
+    @app.post("/api/generations/{generation_id}/refine", status_code=202)
+    def refine_generation(generation_id: str, req: RefineRequest) -> dict:
+        for product in store.list_products():
+            for gen in product.generations:
+                if gen.id == generation_id:
+                    new_gen = Generation(
+                        pipeline=gen.pipeline,
+                        prompt=req.prompt,
+                        negative_prompt=req.negative_prompt
+                        or gen.negative_prompt,
+                        num_outputs=gen.num_outputs,
+                        parent_generation_id=generation_id,
+                        status=JobStatus.pending,
+                    )
+                    product.generations.append(new_gen)
+                    store.save_product(product)
+                    job_id = job_manager.create(product.id, new_gen.id)
+                    thread = threading.Thread(
+                        target=_run_generation,
+                        args=(product, new_gen, job_id),
+                        daemon=True,
+                    )
+                    thread.start()
+                    return {"job_id": job_id, "generation_id": new_gen.id}
+        raise HTTPException(status_code=404, detail="Generation not found")
+
+    return app
