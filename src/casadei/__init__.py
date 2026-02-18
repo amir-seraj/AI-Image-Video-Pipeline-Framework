@@ -15,7 +15,9 @@ from casadei.models.video_edit import VideoEditModel
 from casadei.models.registry import ModelRegistry, default_registry
 from casadei.providers.qwen_image_edit import QwenImageEdit
 from casadei.providers.wan_i2v import WanImageToVideo
+from casadei.providers.wan_i2v_fp8 import WanImageToVideoFP8
 from casadei.providers.wan_video_edit import WanVideoEdit
+from casadei.providers.wan_video_edit_fp8 import WanVideoEditFP8
 from casadei.agent import Agent, AgentConfig, load_agent, save_agent
 from casadei.pipeline import AgentStep, CodeStep, PipelineStep, Pipeline
 from casadei.logging import ExecutionLog, StepLog, LoggedPipeline
@@ -31,8 +33,8 @@ __all__ = [
     "VideoEditModel",
     "ModelRegistry", "default_registry",
     "QwenImageEdit",
-    "WanImageToVideo",
-    "WanVideoEdit",
+    "WanImageToVideo", "WanImageToVideoFP8",
+    "WanVideoEdit", "WanVideoEditFP8",
     "Agent", "AgentConfig", "load_agent", "save_agent",
     "AgentStep", "CodeStep", "PipelineStep", "Pipeline",
     "ExecutionLog", "StepLog", "LoggedPipeline",

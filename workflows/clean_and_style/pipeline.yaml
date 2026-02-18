@@ -1,0 +1,8 @@
+id: clean_and_style
+name: Clean & Style
+description: Remove background then apply a style
+steps:
+  - type: agent
+    agent: background_remover
+  - type: agent
+    agent: style_transfer

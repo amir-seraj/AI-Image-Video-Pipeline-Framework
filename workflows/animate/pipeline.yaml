@@ -1,0 +1,6 @@
+id: animate
+name: Animate Sketch
+description: Generate a video from the sketch
+steps:
+  - type: agent
+    agent: image_to_video

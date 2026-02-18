@@ -1,0 +1,6 @@
+id: style_transfer
+name: Style Transfer
+description: Transform sketches into styled artwork
+steps:
+  - type: agent
+    agent: style_transfer

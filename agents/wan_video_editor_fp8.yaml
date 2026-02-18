@@ -1,0 +1,9 @@
+name: video_editor_fp8
+model: wan_video_edit_fp8
+description: Edits video with text guidance (FP8 optimized)
+prompt_template: "$prompt"
+negative_prompt: "worst quality, low quality, blurred"
+params:
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  strength: 0.7

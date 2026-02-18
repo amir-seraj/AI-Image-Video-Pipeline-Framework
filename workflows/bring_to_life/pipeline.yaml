@@ -1,0 +1,8 @@
+id: bring_to_life
+name: Bring to Life
+description: Transform sketch into a photorealistic image then animate
+steps:
+  - type: agent
+    agent: style_transfer
+  - type: agent
+    agent: image_to_video

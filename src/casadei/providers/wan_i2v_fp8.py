@@ -1,14 +1,20 @@
-"""Wan2.1 Image-to-Video model provider."""
+"""Wan2.1 Image-to-Video model provider with FP8 quantization and torch.compile."""
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import torch
+from pathlib import Path
 from PIL import Image as PILImage
 
 from casadei import MODELS_DIR
 from casadei.models.base import ModelCapability, ImageConstraint, TextConstraint, VideoConstraint
 from casadei.models.image_to_video import ImageToVideoModel
+
+logger = logging.getLogger(__name__)
+
+FP8_CACHE_DIR = Path(MODELS_DIR) / "fp8_cache"
 
 try:
     from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
@@ -18,12 +24,24 @@ except ImportError:
     WanImageToVideoPipeline = None
     CLIPVisionModel = None
 
+try:
+    from torchao.quantization import quantize_, Float8WeightOnlyConfig
+except ImportError:
+    quantize_ = None
+    Float8WeightOnlyConfig = None
 
-class WanImageToVideo(ImageToVideoModel):
-    """Wan-AI/Wan2.1-I2V-14B-720P image-to-video model.
+try:
+    import triton  # noqa: F401
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
 
-    Accepts 1 image and a text prompt, produces a video.
-    Uses bfloat16 precision.
+
+class WanImageToVideoFP8(ImageToVideoModel):
+    """Wan-AI/Wan2.1-I2V-14B-720P image-to-video model with FP8 quantization.
+
+    Identical to WanImageToVideo but applies FP8 weight-only quantization
+    and torch.compile to the transformer for faster inference on supported hardware.
     """
 
     MODEL_ID = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
@@ -85,7 +103,58 @@ class WanImageToVideo(ImageToVideoModel):
         )
         if torch.cuda.is_available():
             pipe.to("cuda")
+
+            # FP8 quantization with disk cache for the state_dict
+            fp8_cache_path = FP8_CACHE_DIR / "wan_i2v_14b_720p_fp8_state.pt"
+            self._load_or_quantize(pipe, fp8_cache_path)
+
+            # Apply torch.compile for optimized inference (requires Triton)
+            if _HAS_TRITON:
+                # Use system ptxas (CUDA 13.0) instead of Triton's bundled one
+                import os
+                system_ptxas = "/usr/local/cuda/bin/ptxas"
+                if os.path.exists(system_ptxas):
+                    os.environ["TRITON_PTXAS_PATH"] = system_ptxas
+                try:
+                    pipe.transformer = torch.compile(pipe.transformer, mode="default")
+                except Exception:
+                    logger.warning("torch.compile failed, running without it", exc_info=True)
+            else:
+                logger.warning("Triton not available, skipping torch.compile (FP8 quantization still active)")
+
         self._pipeline = pipe
+
+    @staticmethod
+    def _load_or_quantize(pipe, cache_path: Path) -> None:
+        """Load cached FP8 state_dict or quantize and cache."""
+        if quantize_ is None or Float8WeightOnlyConfig is None:
+            logger.warning("torchao not available, skipping FP8 quantization")
+            return
+
+        # Always apply quantize_ to set up FP8 module structure
+        logger.info("Applying FP8 quantization structure...")
+        quantize_(pipe.transformer, Float8WeightOnlyConfig())
+
+        if cache_path.exists():
+            logger.info("Loading cached FP8 weights from %s", cache_path)
+            try:
+                cached_state = torch.load(cache_path, map_location="cuda", weights_only=True)
+                pipe.transformer.load_state_dict(cached_state)
+                logger.info("FP8 cache loaded successfully")
+                return
+            except Exception:
+                logger.warning("Failed to load FP8 cache, will overwrite", exc_info=True)
+                cache_path.unlink(missing_ok=True)
+
+        # Save the freshly quantized state_dict (just tensors, no pickle issues)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(pipe.transformer.state_dict(), cache_path)
+            size_gb = cache_path.stat().st_size / 1024**3
+            logger.info("Saved FP8 state_dict cache to %s (%.1f GB)", cache_path, size_gb)
+        except Exception:
+            logger.warning("Failed to save FP8 cache", exc_info=True)
+            cache_path.unlink(missing_ok=True)
 
     def unload_model(self) -> None:
         self._pipeline = None

@@ -303,9 +303,14 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
         )
 
     @app.get("/api/models")
-    def list_models() -> list[str]:
+    def list_models() -> list[dict]:
         from casadei.models.registry import default_registry
-        return default_registry.list_models()
+        result = []
+        for name in default_registry.list_models():
+            cls = default_registry.get(name)
+            default_params = getattr(cls, "DEFAULT_PARAMS", {})
+            result.append({"name": name, "default_params": default_params})
+        return result
 
     @app.get("/api/pipelines")
     def list_pipelines() -> list[PipelinePreset]:
@@ -523,6 +528,19 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
 
     # --- Scratch run (workbench) ---
 
+    def _resolve_agent_yaml(agent_name: str, pipeline_dir: Path | None = None) -> Path | None:
+        """Find agent YAML: pipeline-local first, then global."""
+        from casadei import load_agent
+        if pipeline_dir:
+            local_yaml = pipeline_dir / "agents" / f"{agent_name}.yaml"
+            if local_yaml.exists():
+                return local_yaml
+        for gf in agents_dir.glob("*.yaml"):
+            gc = load_agent(gf)
+            if gc.name == agent_name:
+                return gf
+        return None
+
     def _run_scratch(
         run_id: str,
         run_type: str,
@@ -533,64 +551,99 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
     ) -> None:
         """Background thread: runs a single agent or pipeline on a scratch image."""
         try:
+            import importlib.util
             from casadei import Agent, ImageMedia, MediaBundle, TextMedia, load_agent
 
             job_manager.update_progress(job_id, 0.05, "Loading image...")
 
             source_image = ImageMedia.load(image_path)
 
-            agent_name_to_yaml: dict[str, Path] = {}
-            if agents_dir.exists():
-                for yaml_file in agents_dir.glob("*.yaml"):
-                    config = load_agent(yaml_file)
-                    agent_name_to_yaml[config.name] = yaml_file
-
             if run_type == "agent":
-                agent_names = [name]
+                steps = [{"type": "agent", "agent": name}]
+                pipeline_dir = None
             else:
-                preset = None
-                for p in list_pipelines():
-                    if p.id == name:
-                        preset = p
-                        break
-                if not preset:
+                pipeline_dir = workflows_dir / name
+                pipeline_yaml = pipeline_dir / "pipeline.yaml"
+                if not pipeline_yaml.exists():
                     job_manager.fail(job_id, f"Unknown pipeline: {name}")
                     return
-                agent_names = preset.agents
+                with open(pipeline_yaml) as f:
+                    data = yaml.safe_load(f)
+                steps = data.get("steps", [])
 
-            total = len(agent_names)
+            total = len(steps)
             result_images = [source_image]
 
-            for i, agent_name in enumerate(agent_names):
+            for i, step in enumerate(steps):
                 progress = 0.1 + (0.8 * i / max(total, 1))
-                job_manager.update_progress(job_id, progress, f"Running {agent_name}...")
 
-                yaml_path = agent_name_to_yaml.get(agent_name)
-                if not yaml_path:
-                    job_manager.fail(job_id, f"Agent not found: {agent_name}")
-                    return
+                if step["type"] == "agent":
+                    agent_name = step["agent"]
+                    job_manager.update_progress(job_id, progress, f"Running {agent_name}...")
 
-                agent_config = load_agent(yaml_path)
-                agent = Agent(agent_config)
-                agent.load()
+                    yaml_path = _resolve_agent_yaml(agent_name, pipeline_dir)
+                    if not yaml_path:
+                        job_manager.fail(job_id, f"Agent not found: {agent_name}")
+                        return
 
-                try:
-                    bundle_items: dict = {"image": result_images[0]}
-                    if len(result_images) > 1:
-                        bundle_items["image_2"] = result_images[1]
+                    agent_config = load_agent(yaml_path)
+                    agent = Agent(agent_config)
+                    agent.load()
 
-                    template_kwargs = dict(template_variables)
+                    try:
+                        bundle_items: dict = {"image": result_images[0]}
+                        if len(result_images) > 1:
+                            bundle_items["image_2"] = result_images[1]
 
-                    output = agent.execute(
-                        MediaBundle(items=bundle_items),
-                        **template_kwargs,
+                        template_kwargs = dict(template_variables)
+
+                        output = agent.execute(
+                            MediaBundle(items=bundle_items),
+                            **template_kwargs,
+                        )
+
+                        for _key, media in output.items.items():
+                            if isinstance(media, ImageMedia):
+                                result_images = [media]
+                    finally:
+                        agent.unload()
+
+                elif step["type"] == "code":
+                    script_name = step["script"]
+                    function_name = step.get("function", "process")
+                    job_manager.update_progress(job_id, progress, f"Running {script_name}:{function_name}...")
+
+                    if not pipeline_dir:
+                        job_manager.fail(job_id, "Code steps only supported in pipelines")
+                        return
+
+                    script_path = pipeline_dir / "scripts" / script_name
+                    if not script_path.exists():
+                        job_manager.fail(job_id, f"Script not found: {script_name}")
+                        return
+
+                    spec = importlib.util.spec_from_file_location(
+                        f"pipeline_script_{name}_{script_name}", script_path
                     )
+                    if not spec or not spec.loader:
+                        job_manager.fail(job_id, f"Cannot load script: {script_name}")
+                        return
 
-                    for _key, media in output.items.items():
-                        if isinstance(media, ImageMedia):
-                            result_images = [media]
-                finally:
-                    agent.unload()
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+
+                    func = getattr(module, function_name, None)
+                    if not func:
+                        job_manager.fail(job_id, f"Function {function_name} not found in {script_name}")
+                        return
+
+                    context: dict = {"image": result_images[0]}
+                    if len(result_images) > 1:
+                        context["image_2"] = result_images[1]
+
+                    result_context = func(context)
+                    if isinstance(result_context, dict) and "image" in result_context:
+                        result_images = [result_context["image"]]
 
             job_manager.update_progress(job_id, 0.95, "Saving results...")
             scratch_results_dir = results_dir / "scratch" / run_id

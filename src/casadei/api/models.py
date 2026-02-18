@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -82,3 +83,70 @@ class AgentInfo(BaseModel):
     model: str
     description: str
     template_variables: list[str]
+
+
+class RunResponse(BaseModel):
+    job_id: str
+    run_id: str
+
+
+class AgentConfigResponse(BaseModel):
+    """Full agent configuration for detail/edit views."""
+    name: str
+    model: str
+    description: str
+    prompt_template: str
+    negative_prompt: str
+    params: dict[str, Any]
+    template_variables: list[str]
+
+
+class AgentConfigRequest(BaseModel):
+    """Request body for creating/updating an agent."""
+    name: str
+    model: str
+    description: str = ""
+    prompt_template: str = ""
+    negative_prompt: str = ""
+    params: dict[str, Any] = {}
+
+
+class DuplicateAgentRequest(BaseModel):
+    new_name: str
+
+
+class PipelineStepResponse(BaseModel):
+    type: str
+    agent: str | None = None
+    script: str | None = None
+    function: str | None = None
+    exists: bool | None = None
+
+
+class PipelineDetailResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    steps: list[PipelineStepResponse]
+    local_agents: list[str]
+    template_variables: list[str]
+
+
+class PipelineStepRequest(BaseModel):
+    type: str
+    agent: str | None = None
+    script: str | None = None
+    function: str | None = None
+
+
+class PipelineCreateRequest(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    steps: list[PipelineStepRequest] = []
+
+
+class PipelineUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    steps: list[PipelineStepRequest] | None = None
