@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from pathlib import Path
 from PIL import Image as PILImage
@@ -39,6 +38,8 @@ class QwenImageEdit(ImageEditModel):
             ImageConstraint(required=True, max_count=1),
         ],
     )
+
+    PIPELINE_CLS = QwenImageEditPlusPipeline
 
     DEFAULT_PARAMS = {
         "num_inference_steps": 40,
@@ -122,29 +123,50 @@ class QwenImageEdit(ImageEditModel):
         if saved_latents and self.save_steps_dir is not None:
             steps_dir = Path(self.save_steps_dir)
             pipe = self._pipeline
-            vae_config = pipe.vae.config
-            _mean = vae_config["latents_mean"]
-            _std = vae_config["latents_std"]
-            print(f"  Decoding {len(saved_latents)} step latents via VAE...")
+            device = pipe._execution_device
+            dtype = pipe.vae.dtype
+            z_dim = pipe.vae.config.get("z_dim", 16)
+            _mean = pipe.vae.config["latents_mean"]
+            _std = pipe.vae.config["latents_std"]
+
+            # 5D mean/std for the Qwen causal-3D VAE: (1, C, 1, 1, 1)
+            latents_mean = torch.tensor(
+                _mean, device=device, dtype=dtype
+            ).view(1, z_dim, 1, 1, 1)
+            latents_std = torch.tensor(
+                _std, device=device, dtype=dtype
+            ).view(1, z_dim, 1, 1, 1)
+
+            result_img = output.images[0]
+            img_h, img_w = result_img.size[1], result_img.size[0]
+
+            # Unpack packed transformer latents → (B, C, 1, H_lat, W_lat)
+            unpacked = []
+            step_indices = []
             for step_index, lat in saved_latents:
-                with torch.no_grad():
-                    device = next(pipe.vae.parameters()).device
-                    lat = lat.to(device=device)
-                    latents_mean = torch.tensor(
-                        _mean, device=device, dtype=lat.dtype
-                    ).view(1, -1, 1, 1)
-                    latents_std = torch.tensor(
-                        _std, device=device, dtype=lat.dtype
-                    ).view(1, -1, 1, 1)
-                    denormed = lat * latents_std + latents_mean
-                    denormed = denormed.unsqueeze(2)
-                    decoded = pipe.vae.decode(denormed, return_dict=False)[0]
-                pixels = (decoded[0, :, 0].permute(1, 2, 0).float().cpu().numpy() / 2 + 0.5)
-                pixels = (np.clip(pixels, 0, 1) * 255).astype(np.uint8)
-                step_img = PILImage.fromarray(pixels)
-                step_img.save(steps_dir / f"step_{step_index:03d}.png")
+                lat = lat.to(device=device, dtype=dtype)
+                lat_5d = pipe._unpack_latents(lat, img_h, img_w, pipe.vae_scale_factor)
+                unpacked.append(lat_5d)
+                step_indices.append(step_index)
+
+            batch = torch.cat(unpacked, dim=0)
+            denormed = batch * latents_std + latents_mean
+            del unpacked, batch
+
+            print(f"  Decoding {len(step_indices)} step latents via VAE...")
+            with torch.no_grad():
+                decoded = pipe.vae.decode(denormed, return_dict=False)[0]
+            del denormed
+
+            images_4d = decoded[:, :, 0]
+            for i, step_index in enumerate(step_indices):
+                img = pipe.image_processor.postprocess(
+                    images_4d[i : i + 1], output_type="pil"
+                )[0]
+                img.save(steps_dir / f"step_{step_index:03d}.png")
                 print(f"  step {step_index} decoded and saved")
-            del saved_latents
+
+            del saved_latents, decoded, images_4d
             torch.cuda.empty_cache()
 
         result = output.images[0]

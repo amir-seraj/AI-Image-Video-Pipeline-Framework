@@ -47,6 +47,8 @@ class WanImageToVideo(ImageToVideoModel):
         ],
     )
 
+    PIPELINE_CLS = WanImageToVideoPipeline
+
     DEFAULT_PARAMS = {
         "num_frames": 81,
         "num_inference_steps": 50,

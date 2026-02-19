@@ -32,6 +32,7 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 VALID_MODELS = {
     "qwen_image_edit": "full",
     "qwen_image_edit_fp8": "fp8",
+    "qwen_image_edit_gguf": "gguf",
 }
 
 

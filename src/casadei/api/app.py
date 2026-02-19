@@ -308,8 +308,8 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
         result = []
         for name in default_registry.list_models():
             cls = default_registry.get(name)
-            default_params = getattr(cls, "DEFAULT_PARAMS", {})
-            result.append({"name": name, "default_params": default_params})
+            all_params = cls.get_all_params()
+            result.append({"name": name, "default_params": all_params})
         return result
 
     @app.get("/api/pipelines")

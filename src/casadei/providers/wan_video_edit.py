@@ -39,6 +39,8 @@ class WanVideoEdit(VideoEditModel):
         ],
     )
 
+    PIPELINE_CLS = WanVideoToVideoPipeline
+
     DEFAULT_PARAMS = {
         "num_inference_steps": 50,
         "guidance_scale": 5.0,
