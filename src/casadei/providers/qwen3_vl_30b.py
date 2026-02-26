@@ -121,7 +121,7 @@ class Qwen3VL30B(VisionLanguageModel):
         self._model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
             str(LOCAL_DIR),
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": "cuda:0"},
             attn_implementation="sdpa",
         )
         logger.info("Qwen3-VL-30B-A3B-Instruct loaded.")
@@ -151,7 +151,7 @@ class Qwen3VL30B(VisionLanguageModel):
             images=images if images else None,
             padding=True,
             return_tensors="pt",
-        ).to(self._model.device)
+        ).to("cuda")
 
     def _generate_text(
         self,

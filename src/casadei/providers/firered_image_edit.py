@@ -9,6 +9,7 @@ Download + first run:  python src/casadei/providers/firered_image_edit.py
 
 from __future__ import annotations
 
+import gc
 import logging
 from pathlib import Path
 
@@ -103,6 +104,7 @@ class FireRedImageEdit(ImageEditModel):
 
     def unload_model(self) -> None:
         self._pipeline = None
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -120,7 +122,7 @@ class FireRedImageEdit(ImageEditModel):
         params["negative_prompt"] = negative_prompt or params["negative_prompt"]
         clamp_steps(params, "num_inference_steps", self.MIN_STEPS, self.MAX_STEPS)
 
-        target_size = images[0].size
+        target_size = images[-1].size
         saved_latents: list[tuple[int, torch.Tensor]] = []
 
         if self.save_steps_dir is not None:
