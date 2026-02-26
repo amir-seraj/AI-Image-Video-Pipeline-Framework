@@ -164,3 +164,79 @@ class TestMakeDualJudge:
         )
         _, feedback = dual({"sketch": self._img(), "image": self._img()})
         assert feedback == "[Sketch feedback]: heel is off\n[Spec feedback]: color is wrong"
+
+
+# ---------------------------------------------------------------------------
+# Sketch grid assembly
+# ---------------------------------------------------------------------------
+
+class TestBuildSketchGrid:
+    def _sketch(self, w, h, color=(200, 200, 200)):
+        return PILImage.new("RGB", (w, h), color)
+
+    def test_single_square_sketch_unchanged(self):
+        from run_sketch_to_shoe_loop import _build_sketch_grid
+        result = _build_sketch_grid([self._sketch(100, 100)], spacing=0)
+        assert result.size == (100, 100)
+
+    def test_single_non_square_padded_to_square(self):
+        from run_sketch_to_shoe_loop import _build_sketch_grid
+        result = _build_sketch_grid([self._sketch(100, 60)], spacing=0)
+        w, h = result.size
+        assert w == h, f"Expected square, got {w}x{h}"
+
+    def test_two_sketches_output_is_square(self):
+        from run_sketch_to_shoe_loop import _build_sketch_grid
+        result = _build_sketch_grid([self._sketch(100, 100), self._sketch(100, 100)], spacing=0)
+        w, h = result.size
+        assert w == h
+
+    def test_four_sketches_form_2x2_grid(self):
+        from run_sketch_to_shoe_loop import _build_sketch_grid
+        result = _build_sketch_grid([self._sketch(50, 50) for _ in range(4)], spacing=0)
+        assert result.size == (100, 100)
+
+    def test_padding_area_is_white(self):
+        from run_sketch_to_shoe_loop import _build_sketch_grid
+        # non-square black image → padded to square with white border
+        result = _build_sketch_grid([self._sketch(50, 80, (0, 0, 0))], spacing=0)
+        assert result.getpixel((0, 0)) == (255, 255, 255)
+
+    def test_raises_on_empty_list(self):
+        from run_sketch_to_shoe_loop import _build_sketch_grid
+        with pytest.raises(ValueError, match="No sketch images"):
+            _build_sketch_grid([], spacing=0)
+
+
+class TestParseSpecArgs:
+    def test_parses_key_value_pairs(self):
+        from run_sketch_to_shoe_loop import _parse_spec_args
+        result = _parse_spec_args(["style=elegant", "note=chunky sole"])
+        assert result == {"style": "elegant", "note": "chunky sole"}
+
+    def test_empty_list_returns_empty_dict(self):
+        from run_sketch_to_shoe_loop import _parse_spec_args
+        assert _parse_spec_args([]) == {}
+
+    def test_ignores_entries_without_equals(self):
+        from run_sketch_to_shoe_loop import _parse_spec_args
+        result = _parse_spec_args(["valid=yes", "no_equals", "also=good"])
+        assert "valid" in result and "also" in result
+        assert "no_equals" not in result
+
+    def test_value_with_embedded_equals_preserved(self):
+        from run_sketch_to_shoe_loop import _parse_spec_args
+        result = _parse_spec_args(["desc=a=b"])
+        assert result["desc"] == "a=b"
+
+
+class TestBuildExtraSpecsText:
+    def test_formats_as_bullet_lines(self):
+        from run_sketch_to_shoe_loop import _build_extra_specs_text
+        result = _build_extra_specs_text({"style": "elegant", "note": "chunky"})
+        assert "- Style: elegant" in result
+        assert "- Note: chunky" in result
+
+    def test_empty_dict_returns_empty_string(self):
+        from run_sketch_to_shoe_loop import _build_extra_specs_text
+        assert _build_extra_specs_text({}) == ""
