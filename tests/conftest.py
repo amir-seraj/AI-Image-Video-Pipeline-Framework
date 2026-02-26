@@ -1,5 +1,20 @@
 """Shared test fixtures."""
 
+import sys
+from unittest.mock import MagicMock
+
+
+def pytest_configure(config):
+    """Mock GPU-dependent packages before any test module is imported.
+
+    The torchao/diffusers version mismatch in this environment causes
+    diffusers to fail at import time. Mocking diffusers here allows
+    unit tests that only need casadei.media, casadei.loop, etc. to
+    import successfully without a working GPU stack.
+    """
+    if "diffusers" not in sys.modules:
+        sys.modules["diffusers"] = MagicMock()
+
 
 def pytest_addoption(parser):
     parser.addoption(
