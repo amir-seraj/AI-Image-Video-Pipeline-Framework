@@ -255,7 +255,7 @@ def save_results(
             "feedback": it.feedback,
             "duration_ms": it.duration_ms,
         }
-        meta = getattr(it, "metadata", None)
+        meta = it.metadata
         if meta:
             iter_data["sketch_scores"] = meta.get("sketch_scores", {})
             iter_data["sketch_avg"] = meta.get("sketch_avg")
@@ -305,7 +305,7 @@ def save_results(
     for it in loop_result.iterations:
         verdict = "ACCEPT" if it.accepted else "REJECT"
         lines.append(f"  Iteration {it.index}: {verdict} ({it.duration_ms:.1f}ms)")
-        meta = getattr(it, "metadata", None)
+        meta = it.metadata
         if meta:
             if meta.get("sketch_scores"):
                 ss = meta["sketch_scores"]

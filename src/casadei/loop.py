@@ -35,6 +35,7 @@ class LoopIteration:
     accepted: bool
     feedback: str
     duration_ms: float
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -184,7 +185,10 @@ class LoopStep(Step):
 
                 # Always judge — we need the verdict and feedback for logging
                 print(f"  Judging...")
+                working["loop_iteration"] = i
+                working["loop_max_iterations"] = self.max_iterations
                 accepted, feedback = self.judge(working)
+                judge_metadata = working.pop("_judge_metadata", {})
 
                 iter_ms = (time.perf_counter() - iter_start) * 1000
                 print(f"  Iteration total: {iter_ms:.0f}ms")
@@ -198,6 +202,7 @@ class LoopStep(Step):
                     accepted=accepted,
                     feedback=feedback,
                     duration_ms=iter_ms,
+                    metadata=judge_metadata if isinstance(judge_metadata, dict) else {},
                 )
                 loop_result.iterations.append(record)
 
