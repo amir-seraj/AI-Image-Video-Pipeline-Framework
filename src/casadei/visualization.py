@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from casadei.pipeline import Pipeline, Step, AgentStep, CodeStep, PipelineStep
+from casadei.loop import LoopStep
 
 
 def _step_shape(step: Step) -> tuple[str, str]:
@@ -13,6 +14,8 @@ def _step_shape(step: Step) -> tuple[str, str]:
         return "{{", "}}"
     elif isinstance(step, PipelineStep):
         return "[[", "]]"
+    elif isinstance(step, LoopStep):
+        return "(", ")"
     return "[", "]"
 
 
@@ -24,6 +27,8 @@ def _step_label(step: Step) -> str:
         return f"{step.name}\\n(Code)"
     elif isinstance(step, PipelineStep):
         return f"{step.name}\\n(Pipeline: {step.pipeline.name})"
+    elif isinstance(step, LoopStep):
+        return f"{step.name}\\n(Loop x{step.max_iterations})"
     return step.name
 
 

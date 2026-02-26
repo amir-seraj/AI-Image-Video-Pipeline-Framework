@@ -1,0 +1,20 @@
+id: shoe_tryon
+name: Shoe Virtual Try-On
+description: Replace shoes on a model photo with a reference shoe image
+inputs:
+  person:
+    type: image
+    label: Model Photo
+  shoe:
+    type: image
+    label: Shoe Photo
+steps:
+  - type: code
+    script: segment_shoes.py
+    function: process
+  - type: agent
+    agent: shoe_inpaint
+    inputs:
+      image: person
+      mask: mask
+      reference: shoe

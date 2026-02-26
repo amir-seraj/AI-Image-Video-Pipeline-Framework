@@ -26,6 +26,7 @@ from .models import (
     JobStatus,
     PipelineCreateRequest,
     PipelineDetailResponse,
+    PipelineInputDeclaration,
     PipelinePreset,
     PipelineStepRequest,
     PipelineStepResponse,
@@ -41,7 +42,12 @@ from .store import JsonStore
 _DEFAULT_DATA_DIR = Path("data")
 
 
-def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
+def create_app(
+    data_dir: Path = _DEFAULT_DATA_DIR,
+    *,
+    workflows_dir: Path | None = None,
+    agents_dir: Path | None = None,
+) -> FastAPI:
     app = FastAPI(title="Casadei API", version="0.1.0")
 
     app.add_middleware(
@@ -58,13 +64,18 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
     uploads_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    # Store results_dir on app state so tests can inspect output files
+    app.state.results_dir = results_dir
+
     job_manager = JobManager()
 
     project_root = Path(__file__).resolve().parent.parent.parent.parent
-    agents_dir = project_root / "agents"
+    if agents_dir is None:
+        agents_dir = project_root / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
 
-    workflows_dir = project_root / "workflows"
+    if workflows_dir is None:
+        workflows_dir = project_root / "workflows"
     workflows_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Product CRUD ---
@@ -344,12 +355,19 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
 
             agent_names = [s["agent"] for s in data.get("steps", []) if s.get("type") == "agent"]
 
+            raw_inputs = data.get("inputs", {})
+            pipeline_inputs = {
+                k: PipelineInputDeclaration(type=v.get("type", "image"), label=v.get("label", k))
+                for k, v in raw_inputs.items()
+            }
+
             results.append(PipelinePreset(
                 id=data["id"],
                 name=data["name"],
                 description=data.get("description", ""),
                 agents=agent_names,
                 template_variables=template_vars,
+                inputs=pipeline_inputs,
             ))
         return results
 
@@ -402,6 +420,12 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
                 config = load_agent(la)
                 local_agents.append(config.name)
 
+        raw_inputs = data.get("inputs", {})
+        pipeline_inputs = {
+            k: PipelineInputDeclaration(type=v.get("type", "image"), label=v.get("label", k))
+            for k, v in raw_inputs.items()
+        }
+
         return PipelineDetailResponse(
             id=data["id"],
             name=data["name"],
@@ -409,6 +433,7 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
             steps=steps,
             local_agents=local_agents,
             template_variables=template_vars,
+            inputs=pipeline_inputs,
         )
 
     @app.post("/api/pipelines", status_code=201)
@@ -546,17 +571,29 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
         run_type: str,
         name: str,
         template_variables: dict[str, str],
-        image_path: Path,
+        named_images: dict[str, Path],
         job_id: str,
     ) -> None:
-        """Background thread: runs a single agent or pipeline on a scratch image."""
+        """Background thread: runs a single agent or pipeline on scratch images.
+
+        Uses a named context dict so pipelines can work with multiple images.
+        Backward-compatible: single-image pipelines use the "image" key.
+        """
         try:
             import importlib.util
             from casadei import Agent, ImageMedia, MediaBundle, TextMedia, load_agent
 
-            job_manager.update_progress(job_id, 0.05, "Loading image...")
+            job_manager.update_progress(job_id, 0.05, "Loading images...")
 
-            source_image = ImageMedia.load(image_path)
+            # Build named context from uploaded images
+            context: dict = {
+                key: ImageMedia.load(path) for key, path in named_images.items()
+            }
+
+            # Backward compat: if single image without "image" key, alias it
+            if len(context) == 1 and "image" not in context:
+                only_key = next(iter(context))
+                context["image"] = context[only_key]
 
             if run_type == "agent":
                 steps = [{"type": "agent", "agent": name}]
@@ -572,7 +609,6 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
                 steps = data.get("steps", [])
 
             total = len(steps)
-            result_images = [source_image]
 
             for i, step in enumerate(steps):
                 progress = 0.1 + (0.8 * i / max(total, 1))
@@ -591,9 +627,24 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
                     agent.load()
 
                     try:
-                        bundle_items: dict = {"image": result_images[0]}
-                        if len(result_images) > 1:
-                            bundle_items["image_2"] = result_images[1]
+                        # If step has input mapping, build bundle from mapped context keys
+                        step_inputs = step.get("inputs")
+                        if step_inputs:
+                            bundle_items: dict = {}
+                            for bundle_key, context_key in step_inputs.items():
+                                if context_key not in context:
+                                    job_manager.fail(
+                                        job_id,
+                                        f"Step '{agent_name}': context key '{context_key}' "
+                                        f"not found. Available: {list(context.keys())}",
+                                    )
+                                    return
+                                bundle_items[bundle_key] = context[context_key]
+                        else:
+                            # Legacy passthrough: use "image" key
+                            bundle_items = {}
+                            if "image" in context:
+                                bundle_items["image"] = context["image"]
 
                         template_kwargs = dict(template_variables)
 
@@ -602,9 +653,9 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
                             **template_kwargs,
                         )
 
-                        for _key, media in output.items.items():
-                            if isinstance(media, ImageMedia):
-                                result_images = [media]
+                        # Merge agent outputs back into context
+                        for out_key, media in output.items.items():
+                            context[out_key] = media
                     finally:
                         agent.unload()
 
@@ -637,19 +688,23 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
                         job_manager.fail(job_id, f"Function {function_name} not found in {script_name}")
                         return
 
-                    context: dict = {"image": result_images[0]}
-                    if len(result_images) > 1:
-                        context["image_2"] = result_images[1]
-
+                    # Code steps always receive the full context
                     result_context = func(context)
-                    if isinstance(result_context, dict) and "image" in result_context:
-                        result_images = [result_context["image"]]
+                    if isinstance(result_context, dict):
+                        context.update(result_context)
 
             job_manager.update_progress(job_id, 0.95, "Saving results...")
             scratch_results_dir = results_dir / "scratch" / run_id
             scratch_results_dir.mkdir(parents=True, exist_ok=True)
 
-            for idx, img in enumerate(result_images):
+            # Collect all ImageMedia from context for output
+            from casadei import ImageMedia as _IM
+            output_images = [v for v in context.values() if isinstance(v, _IM)]
+            # Prefer the "image" key as primary output
+            if "image" in context and isinstance(context["image"], _IM):
+                output_images = [context["image"]]
+
+            for idx, img in enumerate(output_images):
                 fname = f"output_{idx}.png"
                 img.save(scratch_results_dir / fname)
 
@@ -663,7 +718,9 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
         type: str = fastapi.Form(...),
         name: str = fastapi.Form(...),
         template_variables: str = fastapi.Form("{}"),
-        image: UploadFile = fastapi.File(...),
+        image: UploadFile | None = fastapi.File(None),
+        images: list[UploadFile] = fastapi.File([]),
+        image_keys: str = fastapi.Form("[]"),
     ) -> RunResponse:
         if type not in ("agent", "pipeline"):
             raise HTTPException(status_code=400, detail="type must be 'agent' or 'pipeline'")
@@ -673,18 +730,41 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="template_variables must be valid JSON")
 
-        run_id = uuid.uuid4().hex[:12]
+        try:
+            keys_list = json.loads(image_keys)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="image_keys must be valid JSON")
 
+        run_id = uuid.uuid4().hex[:12]
         scratch_dir = uploads_dir / "scratch" / run_id
         scratch_dir.mkdir(parents=True, exist_ok=True)
-        image_path = scratch_dir / (image.filename or "input.png")
-        image_path.write_bytes(await image.read())
+
+        named_images: dict[str, Path] = {}
+
+        if images and keys_list:
+            # Multi-image mode: pair each uploaded image with its key
+            if len(images) != len(keys_list):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"images count ({len(images)}) must match image_keys count ({len(keys_list)})",
+                )
+            for key, upload in zip(keys_list, images):
+                path = scratch_dir / f"{key}_{upload.filename or 'input.png'}"
+                path.write_bytes(await upload.read())
+                named_images[key] = path
+        elif image:
+            # Legacy single-image mode
+            image_path = scratch_dir / (image.filename or "input.png")
+            image_path.write_bytes(await image.read())
+            named_images["image"] = image_path
+        else:
+            raise HTTPException(status_code=400, detail="No image(s) provided")
 
         job_id = job_manager.create("scratch", run_id)
 
         thread = threading.Thread(
             target=_run_scratch,
-            args=(run_id, type, name, vars_dict, image_path, job_id),
+            args=(run_id, type, name, vars_dict, named_images, job_id),
             daemon=True,
         )
         thread.start()
@@ -725,6 +805,18 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
             if not preset:
                 job_manager.fail(
                     job_id, f"Unknown pipeline: {generation.pipeline}"
+                )
+                return
+
+            # Pipelines with named inputs require the Workbench (multi-image upload)
+            if preset.inputs:
+                input_labels = ", ".join(
+                    v.label for v in preset.inputs.values()
+                )
+                job_manager.fail(
+                    job_id,
+                    f"'{preset.name}' requires multiple image inputs ({input_labels}). "
+                    f"Use the Workbench to run this pipeline.",
                 )
                 return
 
@@ -882,15 +974,10 @@ def create_app(data_dir: Path = _DEFAULT_DATA_DIR) -> FastAPI:
                     if current.status in ("completed", "failed"):
                         break
                     event.clear()
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(
-                                None, event.wait
-                            ),
-                            timeout=30.0,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
+                    # threading.Event.wait with timeout — runs in threadpool
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: event.wait(timeout=30.0)
+                    )
             finally:
                 job_manager.unsubscribe(job_id, event)
 

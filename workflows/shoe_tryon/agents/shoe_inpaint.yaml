@@ -1,0 +1,11 @@
+name: shoe_inpaint
+model: sdxl_ipadapter_inpaint
+description: Replace masked shoe area using IP-Adapter reference conditioning
+prompt_template: a high quality photo of a shoe on a foot, photorealistic, detailed, fashion photography
+negative_prompt: blurry, distorted, low quality, cartoon, deformed, extra limbs, bad anatomy
+params:
+  num_inference_steps: 40
+  guidance_scale: 7.5
+  ip_adapter_scale: 0.95
+  strength: 0.99
+  crop_padding: 0.4

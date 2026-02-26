@@ -40,10 +40,16 @@ except ImportError:
     CLIPVisionModel = None
 
 try:
-    from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+    from torchao.quantization import quantize_, Float8WeightOnlyConfig
 except ImportError:
     quantize_ = None
-    Float8DynamicActivationFloat8WeightConfig = None
+    Float8WeightOnlyConfig = None
+
+try:
+    from diffusers.hooks import apply_taylorseer_cache, TaylorSeerCacheConfig
+except ImportError:
+    apply_taylorseer_cache = None
+    TaylorSeerCacheConfig = None
 
 
 class WanImageToVideoFP8(ImageToVideoModel):
@@ -115,24 +121,33 @@ class WanImageToVideoFP8(ImageToVideoModel):
         if torch.cuda.is_available():
             pipe.to("cuda")
 
-            if quantize_ is not None and Float8DynamicActivationFloat8WeightConfig is not None:
-                logger.info("Applying FP8 dynamic activation + weight quantization...")
-                quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())
+            if quantize_ is not None and Float8WeightOnlyConfig is not None:
+                logger.info("Applying FP8 weight-only quantization...")
+                quantize_(pipe.transformer, Float8WeightOnlyConfig())
             else:
                 logger.warning("torchao not available, skipping FP8 quantization")
 
             try:
-                torch._inductor.config.coordinate_descent_tuning = False
-                torch._inductor.config.max_autotune = False
                 pipe.transformer = torch.compile(
-                    pipe.transformer, backend="inductor", mode="reduce-overhead"
+                    pipe.transformer, mode="default"
                 )
-                logger.info("torch.compile(backend='inductor', mode='reduce-overhead') applied")
+                logger.info("torch.compile(mode='default') applied")
             except Exception:
                 logger.warning(
                     "torch.compile failed, running in eager mode",
                     exc_info=True,
                 )
+
+            if apply_taylorseer_cache is not None:
+                apply_taylorseer_cache(
+                    pipe.transformer,
+                    TaylorSeerCacheConfig(
+                        cache_interval=5,
+                        disable_cache_before_step=3,
+                        max_order=1,
+                    ),
+                )
+                logger.info("TaylorSeer cache applied (cache_interval=5)")
 
         self._pipeline = pipe
 

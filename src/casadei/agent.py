@@ -48,7 +48,7 @@ class Agent:
         if self._model is None:
             raise RuntimeError("Agent not loaded. Call load() first.")
         prepared = self._prepare_inputs(inputs, **template_kwargs)
-        return self._model.run(prepared)
+        return self._model.run(prepared, **self.config.params)
 
     def _prepare_inputs(self, inputs: MediaBundle, **template_kwargs: Any) -> MediaBundle:
         items = dict(inputs.items)

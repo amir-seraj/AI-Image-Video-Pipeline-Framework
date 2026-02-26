@@ -1,20 +1,22 @@
-"""HunyuanImage-3.0-Instruct NF4 provider.
+"""HunyuanImage-3.0-Instruct-Distil INT8 provider.
 
-Loads EricRollei/HunyuanImage-3.0-Instruct-NF4 — a pre-quantized NF4 (4-bit)
-version of Tencent's 83B MoE image generation model. Uses ~45 GB memory,
-fits comfortably on Jetson Thor (128 GB unified).
+Loads EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8 — an INT8 quantized
+version of Tencent's 83B MoE distilled image generation model. Uses ~85 GB
+memory, fits on Jetson Thor (128 GB unified).
 
-Uses bitsandbytes NF4 quantization with standard transformers API.
+Distil variant: only 8 diffusion steps (vs 50 for Instruct), CFG-distilled
+(no classifier-free guidance needed). ~6x faster than the full Instruct model.
+
+Uses bitsandbytes INT8 quantization with standard transformers API.
 No FlashInfer dependency — uses eager MoE + PyTorch SDPA attention.
 
-Download + first run:  python src/casadei/providers/hunyuan_image3_instruct_nf4.py
+Download + first run:  python src/casadei/providers/hunyuan_image3_distil_int8.py
 """
 
 from __future__ import annotations
 
 import logging
 import sys
-import tempfile
 from pathlib import Path
 
 import torch
@@ -27,35 +29,25 @@ from casadei.providers._base import verify_safetensors, clamp_steps
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "EricRollei/HunyuanImage-3.0-Instruct-NF4"
-LOCAL_DIR = MODELS_DIR / "HunyuanImage-3-Instruct-NF4"
+MODEL_ID = "EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8"
 
 
-def download_model() -> Path:
-    """Download the NF4 model to LOCAL_DIR if not already present."""
+def download_model() -> None:
+    """Download the Distil-INT8 model to HF cache if not already present."""
     from huggingface_hub import snapshot_download
 
-    existing = sorted(LOCAL_DIR.glob("model-*-of-*.safetensors"))
-    expected = 10
-    if len(existing) >= expected:
-        print(f"All {expected} shards present at {LOCAL_DIR}")
-        return LOCAL_DIR
-
-    if existing:
-        print(f"Incomplete: {len(existing)}/{expected} shards. Resuming...")
-    else:
-        print(f"Downloading {MODEL_ID} to {LOCAL_DIR} ...")
-        print("This is ~45 GB (NF4 pre-quantized) and will take a while.")
-    snapshot_download(MODEL_ID, local_dir=str(LOCAL_DIR))
-    print(f"Download complete: {LOCAL_DIR}")
-    return LOCAL_DIR
+    print(f"Downloading {MODEL_ID} (~80 GB) ...")
+    snapshot_download(MODEL_ID, cache_dir=MODELS_DIR)
+    verify_safetensors(MODEL_ID, MODELS_DIR)
+    print("Download complete.")
 
 
-class HunyuanImage3InstructNF4(ImageEditModel):
-    """HunyuanImage-3.0-Instruct — NF4 quantized (bitsandbytes 4-bit).
+class HunyuanImage3DistilINT8(ImageEditModel):
+    """HunyuanImage-3.0-Instruct-Distil — INT8 quantized (bitsandbytes 8-bit).
 
-    83B MoE model with NF4 quantization on FFN/expert layers, attention
-    projections and VAE kept in BF16. Uses ~45 GB memory total.
+    83B MoE distilled model with INT8 quantization on FFN/expert layers,
+    attention projections and VAE kept in BF16. Uses ~85 GB memory.
+    CFG-distilled: only 8 diffusion steps, no guidance needed.
     Supports text-to-image and image editing via generate_image().
     """
 
@@ -74,7 +66,7 @@ class HunyuanImage3InstructNF4(ImageEditModel):
     )
 
     DEFAULT_PARAMS = {
-        "diff_infer_steps": 50,
+        "diff_infer_steps": 8,
         "seed": 42,
         "image_size": "auto",
         "use_system_prompt": "en_unified",
@@ -82,63 +74,48 @@ class HunyuanImage3InstructNF4(ImageEditModel):
     }
 
     MIN_STEPS = 1
-    MAX_STEPS = 100
+    MAX_STEPS = 20
 
     def __init__(self) -> None:
         super().__init__()
         self._model = None
 
-    # Fraction of GPU memory PyTorch may use.  On Jetson Thor the GPU and
-    # CPU share the same 128 GB — without a cap the CUDA allocator can
-    # starve the OS and trigger the OOM-killer, crashing the machine.
-    _CUDA_MEM_FRACTION = 0.90  # ~115 GB on a 128 GB Thor
+    _CUDA_MEM_FRACTION = 0.90
 
     def load_model(self) -> None:
         from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
-        if LOCAL_DIR.exists():
-            verify_safetensors(MODEL_ID, LOCAL_DIR)
-
-        model_path = LOCAL_DIR if LOCAL_DIR.exists() else MODEL_ID
+        verify_safetensors(MODEL_ID, MODELS_DIR)
 
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
         )
 
-        # Tell device_map the GPU has plenty of room so it keeps all
-        # modules on-device (bitsandbytes NF4 cannot run on CPU).
-        # Do NOT set "cpu": "0GiB" — that caused other issues.
         max_memory = None
         if torch.cuda.is_available():
             total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             max_memory = {0: f"{int(total_gb * 0.90)}GiB"}
 
-        logger.info("Loading %s with NF4 quantization...", model_path)
+        logger.info("Loading %s with INT8 quantization...", MODEL_ID)
         model = AutoModelForCausalLM.from_pretrained(
-            str(model_path),
+            MODEL_ID,
             quantization_config=bnb_config,
             device_map="auto",
             max_memory=max_memory,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
+            cache_dir=MODELS_DIR,
         )
-        model.load_tokenizer(str(model_path))
+        model.load_tokenizer(MODEL_ID)
 
-        # Cap the CUDA allocator AFTER loading so inference cannot
-        # claim all unified memory and OOM-kill the machine.
         if torch.cuda.is_available():
             torch.cuda.set_per_process_memory_fraction(
                 self._CUDA_MEM_FRACTION, device=0
             )
 
         # --- Safety-net monkey-patches for upstream model bugs ----------
-        # Primary fixes are applied directly to the cached model files
-        # (modeling_hunyuan_image_3.py).  These patches guard against the
-        # cached files being overwritten by a re-download.
         import importlib
         mod = importlib.import_module(type(model).__module__)
 
@@ -171,7 +148,6 @@ class HunyuanImage3InstructNF4(ImageEditModel):
         self._model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # Lift the memory cap so subsequent models get full GPU.
             torch.cuda.set_per_process_memory_fraction(1.0, device=0)
 
     def _edit(
@@ -192,7 +168,7 @@ class HunyuanImage3InstructNF4(ImageEditModel):
             "image_size": params.get("image_size", "auto"),
             "use_system_prompt": params.get("use_system_prompt", "en_unified"),
             "bot_task": params.get("bot_task", "think_recaption"),
-            "diff_infer_steps": params.get("diff_infer_steps", 50),
+            "diff_infer_steps": params.get("diff_infer_steps", 8),
         }
 
         clamp_steps(gen_kwargs, "diff_infer_steps", self.MIN_STEPS, self.MAX_STEPS)

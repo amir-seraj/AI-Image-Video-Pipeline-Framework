@@ -94,18 +94,24 @@ class Pipeline:
         return context
 
     def load(self) -> None:
+        from casadei.loop import LoopStep
         for step in self.steps:
             if isinstance(step, AgentStep):
                 step.agent.load()
             elif isinstance(step, PipelineStep):
                 step.pipeline.load()
+            elif isinstance(step, LoopStep):
+                step.load()
 
     def unload(self) -> None:
+        from casadei.loop import LoopStep
         for step in self.steps:
             if isinstance(step, AgentStep):
                 step.agent.unload()
             elif isinstance(step, PipelineStep):
                 step.pipeline.unload()
+            elif isinstance(step, LoopStep):
+                step.unload()
 
     @classmethod
     def compose(cls, name: str, pipelines: list[Pipeline]) -> Pipeline:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 import uuid
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ class JobManager:
     def __init__(self) -> None:
         self._jobs: dict[str, JobState] = {}
         self._lock = threading.Lock()
-        self._events: dict[str, list[asyncio.Event]] = {}
+        self._events: dict[str, list[threading.Event]] = {}
 
     def create(self, product_id: str, generation_id: str) -> str:
         job_id = uuid.uuid4().hex[:12]
@@ -67,13 +66,13 @@ class JobManager:
                 job.error = error
         self._notify(job_id)
 
-    def subscribe(self, job_id: str) -> asyncio.Event:
-        event = asyncio.Event()
+    def subscribe(self, job_id: str) -> threading.Event:
+        event = threading.Event()
         with self._lock:
             self._events.setdefault(job_id, []).append(event)
         return event
 
-    def unsubscribe(self, job_id: str, event: asyncio.Event) -> None:
+    def unsubscribe(self, job_id: str, event: threading.Event) -> None:
         with self._lock:
             listeners = self._events.get(job_id, [])
             if event in listeners:

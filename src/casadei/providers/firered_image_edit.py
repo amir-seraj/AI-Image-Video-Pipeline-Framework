@@ -1,9 +1,18 @@
-"""Qwen Image Edit model provider."""
+"""FireRed-Image-Edit-1.0 provider.
+
+FireRedTeam's 20B MMDiT image editing model built on Qwen-Image foundation.
+Uses QwenImageEditPlusPipeline (same as Qwen-Image-Edit). ~58 GB in BF16,
+fits on Jetson Thor (128 GB unified) without quantization.
+
+Download + first run:  python src/casadei/providers/firered_image_edit.py
+"""
 
 from __future__ import annotations
 
-import torch
+import logging
 from pathlib import Path
+
+import torch
 from PIL import Image as PILImage
 
 from casadei import MODELS_DIR
@@ -15,20 +24,34 @@ from casadei.providers._base import (
     make_step_callback,
 )
 
+logger = logging.getLogger(__name__)
+
+MODEL_ID = "FireRedTeam/FireRed-Image-Edit-1.0"
+
 try:
     from diffusers import QwenImageEditPlusPipeline
 except ImportError:
     QwenImageEditPlusPipeline = None
 
 
-class QwenImageEdit(ImageEditModel):
-    """Qwen/Qwen-Image-Edit-2511 model.
+def download_model() -> None:
+    """Download the model to HF cache if not already present."""
+    from huggingface_hub import snapshot_download
 
-    Accepts up to 2 images and a text prompt, produces 1 edited image.
-    Requires CUDA GPU with bfloat16 support.
+    print(f"Downloading {MODEL_ID} (~58 GB) ...")
+    snapshot_download(MODEL_ID, cache_dir=MODELS_DIR)
+    print("Download complete.")
+
+
+class FireRedImageEdit(ImageEditModel):
+    """FireRedTeam/FireRed-Image-Edit-1.0 — 20B MMDiT image editor.
+
+    Built on the Qwen-Image foundation. Accepts up to 2 images and a text
+    prompt, produces 1 edited image. Uses QwenImageEditPlusPipeline.
+    ~58 GB in BF16.
     """
 
-    MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
+    MODEL_ID = MODEL_ID
 
     capability = ModelCapability(
         inputs=[
@@ -37,7 +60,7 @@ class QwenImageEdit(ImageEditModel):
                 max_count=2,
                 supported_formats=["png", "jpg", "jpeg", "webp"],
             ),
-            TextConstraint(required=True),
+            TextConstraint(required=True, max_count=2),
         ],
         outputs=[
             ImageConstraint(required=True, max_count=1),
@@ -48,7 +71,7 @@ class QwenImageEdit(ImageEditModel):
 
     DEFAULT_PARAMS = {
         "num_inference_steps": 40,
-        "true_cfg_scale": 4.0,
+        "true_cfg_scale": 2.0,
         "negative_prompt": " ",
         "num_images_per_prompt": 1,
     }
@@ -125,3 +148,7 @@ class QwenImageEdit(ImageEditModel):
         if result.size != target_size:
             result = result.resize(target_size, PILImage.LANCZOS)
         return result
+
+
+if __name__ == "__main__":
+    download_model()

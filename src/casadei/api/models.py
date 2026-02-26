@@ -70,12 +70,18 @@ class RefineRequest(BaseModel):
     negative_prompt: str = ""
 
 
+class PipelineInputDeclaration(BaseModel):
+    type: str
+    label: str
+
+
 class PipelinePreset(BaseModel):
     id: str
     name: str
     description: str
     agents: list[str]
     template_variables: list[str]
+    inputs: dict[str, PipelineInputDeclaration] = {}
 
 
 class AgentInfo(BaseModel):
@@ -130,6 +136,7 @@ class PipelineDetailResponse(BaseModel):
     steps: list[PipelineStepResponse]
     local_agents: list[str]
     template_variables: list[str]
+    inputs: dict[str, PipelineInputDeclaration] = {}
 
 
 class PipelineStepRequest(BaseModel):

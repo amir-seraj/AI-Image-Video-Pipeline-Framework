@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-import numpy as np
 import torch
 from pathlib import Path
 from PIL import Image as PILImage
@@ -25,6 +24,11 @@ from PIL import Image as PILImage
 from casadei import MODELS_DIR
 from casadei.models.base import ModelCapability, ImageConstraint, TextConstraint
 from casadei.models.image_edit import ImageEditModel
+from casadei.providers._base import (
+    clamp_steps,
+    decode_and_save_step_latents,
+    make_step_callback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +87,9 @@ class QwenImageEditFP8(ImageEditModel):
         "negative_prompt": " ",
         "num_images_per_prompt": 1,
     }
+
+    MIN_STEPS = 1
+    MAX_STEPS = 50
 
     def __init__(self) -> None:
         super().__init__()
@@ -168,27 +175,17 @@ class QwenImageEditFP8(ImageEditModel):
 
         params = {**self.DEFAULT_PARAMS, **kwargs}
         params["negative_prompt"] = negative_prompt or params["negative_prompt"]
+        clamp_steps(params, "num_inference_steps", self.MIN_STEPS, self.MAX_STEPS)
 
         target_size = images[0].size
-
-        # Collect latents during inference for deferred VAE decode
         saved_latents: list[tuple[int, torch.Tensor]] = []
 
         if self.save_steps_dir is not None:
             steps_dir = Path(self.save_steps_dir)
             steps_dir.mkdir(parents=True, exist_ok=True)
-            interval = self.save_steps_interval
-
-            def callback_on_step_end(_pipe, step_index, timestep, callback_kwargs):
-                if step_index % interval != 0:
-                    return callback_kwargs
-                saved_latents.append(
-                    (step_index, callback_kwargs["latents"].detach().cpu())
-                )
-                print(f"  step {step_index} latents captured")
-                return callback_kwargs
-
-            params["callback_on_step_end"] = callback_on_step_end
+            params["callback_on_step_end"] = make_step_callback(
+                saved_latents, self.save_steps_interval
+            )
             params["callback_on_step_end_tensor_inputs"] = ["latents"]
 
         with torch.inference_mode():
@@ -198,61 +195,11 @@ class QwenImageEditFP8(ImageEditModel):
                 **params,
             )
 
-        # Decode saved latents through VAE now that the transformer is offloaded
         if saved_latents and self.save_steps_dir is not None:
-            steps_dir = Path(self.save_steps_dir)
-            pipe = self._pipeline
-            device = pipe._execution_device
-            dtype = pipe.vae.dtype
-            z_dim = pipe.vae.config.get("z_dim", 16)
-            _mean = pipe.vae.config["latents_mean"]
-            _std = pipe.vae.config["latents_std"]
-
-            # 5D mean/std for the Qwen causal-3D VAE: (1, C, 1, 1, 1)
-            latents_mean = torch.tensor(
-                _mean, device=device, dtype=dtype
-            ).view(1, z_dim, 1, 1, 1)
-            latents_std = torch.tensor(
-                _std, device=device, dtype=dtype
-            ).view(1, z_dim, 1, 1, 1)
-
-            # Use output image dimensions for correct unpack geometry
-            result_img = output.images[0]
-            img_h, img_w = result_img.size[1], result_img.size[0]
-
-            # Unpack all saved latents from packed transformer format
-            # (B, num_patches, C*4) -> (B, C, 1, H_lat, W_lat)
-            unpacked = []
-            step_indices = []
-            for step_index, lat in saved_latents:
-                lat = lat.to(device=device, dtype=dtype)
-                lat_5d = pipe._unpack_latents(
-                    lat, img_h, img_w, pipe.vae_scale_factor
-                )
-                unpacked.append(lat_5d)
-                step_indices.append(step_index)
-
-            # Batch decode: single VAE GPU transfer instead of N
-            batch = torch.cat(unpacked, dim=0)
-            denormed = batch * latents_std + latents_mean
-            del unpacked, batch
-
-            print(f"  Decoding {len(step_indices)} step latents via VAE...")
-            with torch.no_grad():
-                decoded = pipe.vae.decode(denormed, return_dict=False)[0]
-            del denormed
-
-            # Remove temporal dim and postprocess to PIL
-            images_4d = decoded[:, :, 0]
-            for i, step_index in enumerate(step_indices):
-                img = pipe.image_processor.postprocess(
-                    images_4d[i : i + 1], output_type="pil"
-                )[0]
-                img.save(steps_dir / f"step_{step_index:03d}.png")
-                print(f"  step {step_index} saved")
-
-            del saved_latents, decoded, images_4d
-            torch.cuda.empty_cache()
+            decode_and_save_step_latents(
+                saved_latents, self._pipeline,
+                output.images[0], Path(self.save_steps_dir),
+            )
 
         result = output.images[0]
         if result.size != target_size:

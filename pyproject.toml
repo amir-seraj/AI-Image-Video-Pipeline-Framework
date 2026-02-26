@@ -22,6 +22,8 @@ dependencies = [
     "uvicorn[standard]>=0.34.0",
     "sse-starlette>=2.0.0",
     "python-multipart>=0.0.18",
+    "python-dotenv>=1.0.0",
+    "voyageai>=0.3.0",
 ]
 
 [project.optional-dependencies]

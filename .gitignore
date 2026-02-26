@@ -11,6 +11,8 @@ build/
 .conda_env/
 models/
 
+.env.example
+
 # Test output
 tests/output/
 
