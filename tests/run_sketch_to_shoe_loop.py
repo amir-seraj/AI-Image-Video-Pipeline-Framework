@@ -255,11 +255,12 @@ def save_results(
             "feedback": it.feedback,
             "duration_ms": it.duration_ms,
         }
-        if it.metadata:
-            iter_data["sketch_scores"] = it.metadata.get("sketch_scores", {})
-            iter_data["sketch_avg"] = it.metadata.get("sketch_avg")
-            iter_data["spec_scores"] = it.metadata.get("spec_scores", {})
-            iter_data["spec_avg"] = it.metadata.get("spec_avg")
+        meta = getattr(it, "metadata", None)
+        if meta:
+            iter_data["sketch_scores"] = meta.get("sketch_scores", {})
+            iter_data["sketch_avg"] = meta.get("sketch_avg")
+            iter_data["spec_scores"] = meta.get("spec_scores", {})
+            iter_data["spec_avg"] = meta.get("spec_avg")
 
         candidate_img = it.outputs.get("image")
         if isinstance(candidate_img, ImageMedia):
@@ -304,15 +305,16 @@ def save_results(
     for it in loop_result.iterations:
         verdict = "ACCEPT" if it.accepted else "REJECT"
         lines.append(f"  Iteration {it.index}: {verdict} ({it.duration_ms:.1f}ms)")
-        if it.metadata:
-            if it.metadata.get("sketch_scores"):
-                ss = it.metadata["sketch_scores"]
+        meta = getattr(it, "metadata", None)
+        if meta:
+            if meta.get("sketch_scores"):
+                ss = meta["sketch_scores"]
                 lines.append(f"    Sketch: {', '.join(f'{k}={v}' for k,v in ss.items())} "
-                              f"(avg={it.metadata.get('sketch_avg')})")
-            if it.metadata.get("spec_scores"):
-                ss = it.metadata["spec_scores"]
+                              f"(avg={meta.get('sketch_avg')})")
+            if meta.get("spec_scores"):
+                ss = meta["spec_scores"]
                 lines.append(f"    Spec:   {', '.join(f'{k}={v}' for k,v in ss.items())} "
-                              f"(avg={it.metadata.get('spec_avg')})")
+                              f"(avg={meta.get('spec_avg')})")
         lines.append(f"    Feedback: {it.feedback[:200]}")
         lines.append("")
 
