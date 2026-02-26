@@ -28,7 +28,7 @@ class TestParseScores:
 
     def test_raises_on_empty_scores(self):
         from judge import _parse_scores
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Could not parse any scores"):
             _parse_scores("SCORES: ")
 
     def test_float_scores(self):
@@ -57,7 +57,7 @@ class TestExtractSketchFeaturesFallback:
     def _make_session(self, response_text: str):
         session = MagicMock()
         model = MagicMock()
-        model.run_streaming.return_value = iter([response_text])
+        model.run_streaming.side_effect = lambda bundle: iter([response_text])
         session.acquire.return_value = model
         return session
 
