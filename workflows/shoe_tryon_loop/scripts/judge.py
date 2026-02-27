@@ -20,45 +20,82 @@ from casadei.media import ImageMedia, Media, TextMedia, MediaBundle
 # ---------------------------------------------------------------------------
 
 _SCORE_PROMPT = """\
-You are a quality inspector for a shoe replacement system.
+You are comparing shoes across two images.
 
-The first image is the REFERENCE SHOE PHOTO — the original product photo \
-showing the exact shoe design that must appear on the person's feet.
-The second image is the GENERATED RESULT — {result_description}
+The first image is the REFERENCE SHOE — a product photo of the target shoe.
+The second image shows a PERSON WEARING SHOES — examine only the shoes \
+on their feet.
 
-Your job: examine the shoes on the person's feet in the generated result \
-and rate how closely they match the reference shoe photo.
+Your job: for each listed attribute, score how closely the shoes on the \
+person's feet match the same attribute in the reference shoe.
 
 {iteration_context}\
 {previous_feedback}\
 {stale_nudge}\
-Score each attribute from 1 to 5:
-  1 = completely different from the reference shoe
+Scoring scale:
+  1 = completely different from the reference
   2 = vaguely similar but clearly wrong
-  3 = recognizably the same shoe type but noticeable differences
+  3 = same general type but noticeable differences
   4 = close match with only minor differences
-  5 = near-identical to the reference shoe
+  5 = identical match
 
 Attributes to score: {features}
 
-Reply in this exact format:
+Check BOTH feet individually. For "both feet match": score 1 if the two \
+feet show different shoes (one matches the reference, the other does not); \
+score 5 only if both feet wear identical shoes that match the reference.
+
+Reply in this exact format. Replace each [1-5] with your actual integer score:
 SCORES: {score_format}
-REPAIR: <describe what is wrong in the generated result compared to \
-the reference shoe photo, then tell the model to look at the reference \
-shoe photo and match that part — do NOT give direct orders like \
-"make it X", instead point out the mismatch and direct the model to \
-use the reference shoe photo to fix it>
+REPAIR: <for every attribute that scored below 5, describe the exact \
+mismatch — what you see on the person's feet vs. what the reference shoe \
+shows for that attribute. Be specific: name the attribute and describe \
+what is different>
+
+Example of a correctly filled response (scores are illustrative):
+SCORES: {example_format}
+REPAIR: The heel appears lower than the reference ...
 """
 
 _FEATURE_PROMPT = """\
-Look at this shoe image. List 4-6 short visual attribute names that \
-describe its key features (e.g. color, heel type, material, toe shape, sole style).
+You are looking at a product shoe photo. Extract a complete and precise \
+description of this shoe as a list of attribute tags.
 
-Reply with ONLY a JSON array of short strings. Example:
-["red color", "block heel", "platform sole", "pointed toe", "patent leather"]
+These tags will be used as scoring criteria by another agent: given only \
+your tag list and a new image, that agent must be able to check each tag \
+individually and say whether the shoe in the new image matches or not. \
+So every tag must be specific and verifiable — "red patent leather" is \
+verifiable; "nice material" is not.
+
+Cover every visible dimension — record the concrete value you observe, \
+not just the category name:
+- Type / silhouette  (e.g. "stiletto pump", "over-the-knee boot", "platform mule")
+- Color(s) / pattern  (e.g. "deep burgundy", "zebra print", "two-tone black and white")
+- Material / texture  (e.g. "croc-embossed patent leather", "shearling lining", "mesh upper")
+- Heel  (e.g. "clear lucite stiletto ~12cm", "stacked wooden block heel ~5cm", "flat")
+- Toe  (e.g. "extreme pointed toe", "open square toe", "closed almond toe")
+- Closure / straps  (e.g. "criss-cross ankle lacing", "elasticated strap", "side zip")
+- Sole / platform  (e.g. "transparent platform ~4cm", "rubber lug sole", "thin leather sole")
+- Hardware / details  (e.g. "oversized gold chain trim", "crystal toe cap", "logo plate")
+
+Reply with ONLY a JSON array of 6–10 descriptor strings. \
+No explanation, no markdown — just the array.
+
+Example:
+["deep red croc-embossed patent leather pump", "clear lucite stiletto heel ~12cm", \
+"transparent platform sole ~4cm", "open square toe", \
+"ankle wrap lacing with gold rings", "gold hardware throughout"]
 """
 
-_FALLBACK_FEATURES = ["color", "shape", "heel", "material", "details"]
+_FALLBACK_FEATURES = [
+    "shoe type and silhouette",
+    "color and pattern",
+    "heel type and height",
+    "material and texture",
+    "toe shape",
+    "closure and straps",
+    "sole style",
+]
 
 TOLERANCE_CONFIGS = {
     "generous":  {"avg_threshold": 2.5, "min_floor": 1.5},
@@ -160,11 +197,17 @@ def _concat_candidates(images: list[PILImage.Image], label_height: int = 40) -> 
 
 
 def _parse_scores(text: str) -> dict[str, float]:
-    """Parse 'SCORES: attr1=N, attr2=N, ...' from VLM response."""
+    """Parse 'SCORES: attr1=4, attr2=2, ...' from VLM response."""
     scores_match = re.search(r"SCORES:\s*(.+)", text, re.IGNORECASE)
     if not scores_match:
         raise ValueError("No 'SCORES:' line found")
     scores_text = scores_match.group(1).strip()
+    # Detect if VLM echoed back the placeholder instead of filling in numbers
+    if re.search(r"=\[1-5\]", scores_text) or re.search(r"=N\b", scores_text):
+        raise ValueError(
+            "Scores contain unfilled placeholders ([1-5] or N). "
+            "Replace each placeholder with an actual integer 1-5."
+        )
     scores = {}
     for pair in re.split(r",\s*", scores_text):
         pair = pair.strip()
@@ -295,6 +338,11 @@ def make_judge(
     if features is None:
         features = list(_FALLBACK_FEATURES)
 
+    # Always include consistency check — catches partial replacements
+    _CONSISTENCY_ATTR = "both feet match"
+    if _CONSISTENCY_ATTR not in features:
+        features = list(features) + [_CONSISTENCY_ATTR]
+
     tol = TOLERANCE_CONFIGS.get(tolerance, TOLERANCE_CONFIGS["strict"])
     avg_threshold = tol["avg_threshold"]
     min_floor = tol["min_floor"]
@@ -304,7 +352,11 @@ def make_judge(
     stale_count: list[int] = [0]
     prev_feedback: list[str] = [""]
 
-    score_format = ", ".join(f"{f}=N" for f in features)
+    # Use [1-5] as placeholder — unambiguous for VLMs (N was being echoed literally)
+    score_format = ", ".join(f"{f}=[1-5]" for f in features)
+    # Concrete filled example using the real attribute names — shows the model exactly
+    # what a valid SCORES line looks like (values are illustrative, not real scores)
+    example_format = ", ".join(f"{f}=3" for f in features)
 
     def judge(context: dict[str, Media]) -> tuple[bool, str]:
         candidate = context.get(candidate_key)
@@ -319,21 +371,13 @@ def make_judge(
         max_iterations = context.get("loop_max_iterations", 5)
 
         if iteration == 0:
-            result_description = (
-                "a person whose shoes were just replaced to match the reference shoe."
-            )
             iteration_context = (
-                f"This is the first attempt (1 of {max_iterations}). "
-                f"Check how well the replacement matches the reference shoe.\n"
+                f"This is comparison 1 of {max_iterations}.\n"
             )
         else:
-            result_description = (
-                "a refined attempt where the shoes should more closely match "
-                "the reference shoe than before."
-            )
             iteration_context = (
-                f"This is refinement attempt {iteration + 1} of {max_iterations}. "
-                f"Check whether this refinement improved the match.\n"
+                f"This is comparison {iteration + 1} of {max_iterations}. "
+                f"Check whether the shoes are a closer match than in the previous comparison.\n"
             )
 
         previous_feedback = ""
@@ -345,21 +389,18 @@ def make_judge(
             attr = prev_lowest_attr[0]
             n = stale_count[0]
             stale_nudge = (
-                f"The attribute '{attr}' has been the weakest for {n} consecutive "
-                f"attempts. In your REPAIR instruction, clearly describe what is wrong "
-                f"with '{attr}' in the generated result, then tell the model to look at "
-                f"the reference shoe photo and match that specific part. Do NOT give "
-                f"direct orders like 'make it X'. Instead, point out the mismatch and "
-                f"direct the model to use the reference shoe photo as the source of truth.\n"
+                f"Note: '{attr}' has scored lowest for {n} comparisons in a row. "
+                f"Pay close attention to this attribute and describe the mismatch "
+                f"in precise detail.\n"
             )
 
         prompt_text = _SCORE_PROMPT.format(
-            result_description=result_description,
             iteration_context=iteration_context,
             previous_feedback=previous_feedback,
             stale_nudge=stale_nudge,
             features=", ".join(features),
             score_format=score_format,
+            example_format=example_format,
         )
 
         bundle = MediaBundle(items={
@@ -377,9 +418,11 @@ def make_judge(
                 if attempt > 0 and last_error:
                     retry_prompt = (
                         f"{prompt_text}\n\n"
-                        f"Your previous response could not be parsed. Error: {last_error}\n"
-                        f"Please reply in the exact format:\n"
-                        f"SCORES: {score_format}\n"
+                        f"Your previous response could not be parsed ({last_error}).\n"
+                        f"You MUST replace every [1-5] with an actual integer. "
+                        f"Do not output [1-5] literally.\n"
+                        f"Correct example:\n"
+                        f"SCORES: {example_format}\n"
                         f"REPAIR: ..."
                     )
                     bundle = MediaBundle(items={
@@ -412,8 +455,9 @@ def make_judge(
                     if iteration == 0:
                         generation_feedback = (
                             "The shoes in the second image were replaced in the previous "
-                            "attempt but do not fully match the reference shoe yet. "
-                            "Refine the shoes to better match the reference. "
+                            "attempt but do not fully match the reference shoe photo yet. "
+                            "Ensure BOTH feet have the correct shoe and refine to better "
+                            "match the reference. "
                             f"Specifically: {repair}"
                         )
                     else:

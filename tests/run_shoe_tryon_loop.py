@@ -46,8 +46,9 @@ PROMPT_TEMPLATE = (
     "The first image is the reference shoe photo — the exact shoe design "
     "to reproduce on the person's feet. "
     "The second image shows a person wearing shoes. "
-    "Replace the shoes on the person's feet with the exact shoe from "
-    "the reference shoe photo. Preserve the person's pose, legs, "
+    "Replace BOTH shoes on the person's feet — left foot AND right foot — "
+    "with the exact shoe from the reference shoe photo. Every visible shoe "
+    "must match the reference. Preserve the person's pose, legs, "
     "clothing, and background unchanged. $feedback"
 )
 
