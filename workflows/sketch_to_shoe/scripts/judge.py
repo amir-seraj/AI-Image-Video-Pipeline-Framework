@@ -108,6 +108,12 @@ def _parse_scores(text: str) -> dict[str, float]:
     if not scores_match:
         raise ValueError("No 'SCORES:' line found")
     scores_text = scores_match.group(1).strip()
+    # Detect if VLM echoed back the placeholder instead of filling in numbers
+    if re.search(r"=\[1-5\]", scores_text) or re.search(r"=N\b", scores_text):
+        raise ValueError(
+            "Scores contain unfilled placeholders ([1-5] or N). "
+            "Replace each placeholder with an actual integer 1-5."
+        )
     scores = {}
     for pair in re.split(r",\s*", scores_text):
         pair = pair.strip()
@@ -133,46 +139,69 @@ def _parse_repair(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SKETCH_FEATURE_PROMPT = """\
-Look at this shoe design sketch. List 4-6 short visual attribute names that \
-describe its key design features (e.g. toe shape, heel type, sole style, \
-silhouette, ankle height, strap count).
+You are looking at a shoe design sketch. Extract the key structural and \
+design elements that another agent will use to score whether a generated \
+photo faithfully matches this sketch.
 
-Reply with ONLY a JSON array of short strings. Example:
-["pointed toe", "block heel", "platform sole", "ankle strap", "side zipper"]
+Each tag must be a specific, visually verifiable design element — not a \
+general category. For example, "pointed stiletto toe" is verifiable; \
+"toe shape" is not. Do NOT include any numbers or measurements \
+(no centimeters, no estimates like "~10cm") — use descriptive terms only \
+(e.g. "thin", "high", "chunky", "thick"). Focus on elements that are \
+clearly drawn in the sketch:
+- Silhouette / shoe type  (e.g. "ankle boot", "slingback pump", "platform sneaker")
+- Toe shape  (e.g. "extreme pointed toe", "open square toe", "rounded almond toe")
+- Heel  (e.g. "thin stiletto heel", "chunky block heel", "wedge heel", "flat")
+- Sole / platform  (e.g. "thick platform sole", "thin leather sole", "lug sole")
+- Ankle height  (e.g. "above-ankle cut", "low-cut", "knee-high shaft")
+- Closure / straps  (e.g. "ankle strap with buckle", "side zip", "lace-up front", "slip-on")
+- Notable structural details  (e.g. "cut-out side panel", "oversized buckle", "wrapped heel")
+
+Reply with ONLY a JSON array of 5–8 descriptor strings. \
+No explanation, no markdown — just the array.
+
+Example:
+["pointed stiletto pump", "open peep-toe", "thin stiletto heel", \
+"slim platform sole", "ankle strap with gold buckle", "patent leather upper"]
 """
 
 _SKETCH_SCORE_PROMPT = """\
 You are a design fidelity inspector for a shoe manufacturing system.
 
-IMAGE 1 is the ORIGINAL SKETCH — the designer's intended shoe design.
-IMAGE 2 is the GENERATED PHOTO — a photorealistic rendering that should \
-faithfully represent the sketch.
+The first image is the ORIGINAL SKETCH — the designer's intended shoe design.
+The second image is the GENERATED PHOTO — {result_description}
 
-Your job: compare the shoe in IMAGE 2 to the design in IMAGE 1 and score \
-how closely the generated photo matches the sketch's design intent.
+Your job: compare the shoe in the generated photo to the design in the original \
+sketch and score how closely the generated photo matches the sketch's design intent.
 
 {iteration_context}\
-{previous_feedback}\
 {stale_nudge}\
 Score each attribute from 1 to 5:
   1 = completely different from the sketch
   2 = vaguely similar but clearly wrong
   3 = recognizably the same design but noticeable differences
-  4 = close match with only minor differences
+  4 = close match with minor differences
   5 = near-identical to the sketch design
 
 Attributes to score: {features}
 
-Reply in this exact format:
+Reply in this exact format. Replace each [1-5] with your actual integer score:
 SCORES: {score_format}
-REPAIR: <describe what is wrong in the generated photo compared to the sketch, \
-then tell the model to look at the sketch and correct that specific element>
+REPAIR: <Look at the CURRENT image. Do NOT copy the previous issues verbatim. \
+For each attribute scored below 5, describe what you actually see NOW vs. the sketch. \
+If a previously-identified issue has been RESOLVED in this image, say so explicitly. \
+If it persists, describe the exact mismatch you see in the current image, \
+then tell the model to look at the sketch and correct that specific element.>
+
+Example of a correctly filled response (scores are illustrative):
+SCORES: {example_format}
+REPAIR: The toe shape in the generated photo is rounded but the sketch shows a pointed toe ...
 """
 
 _SPEC_SCORE_PROMPT = """\
 You are a product specification inspector for a shoe manufacturing system.
 
-The image shows a generated photorealistic shoe product photo.
+The image shows a generated photorealistic shoe product photo — {result_description}
 
 Your job: check whether the shoe in the image matches the following \
 design specifications, and evaluate the overall photo quality.
@@ -181,7 +210,6 @@ Design specifications:
 {spec_text}
 
 {iteration_context}\
-{previous_feedback}\
 {stale_nudge}\
 Score each attribute from 1 to 5:
   1 = completely fails this specification
@@ -192,18 +220,24 @@ Score each attribute from 1 to 5:
 
 Attributes to score: {features}
 
-Reply in this exact format:
+Reply in this exact format. Replace each [1-5] with your actual integer score:
 SCORES: {score_format}
-REPAIR: <describe what does not match the specifications, then tell the model \
-specifically what to change to meet them>
+REPAIR: <Look at the CURRENT image. Do NOT copy the previous issues verbatim. \
+For each attribute scored below 5, describe what you actually see NOW vs. the specification. \
+If a previously-identified issue has been RESOLVED in this image, say so explicitly. \
+If it persists, describe exactly what is still wrong and tell the model what to change.>
+
+Example of a correctly filled response (scores are illustrative):
+SCORES: {example_format}
+REPAIR: The material appears to be canvas rather than the specified leather ...
 """
 
 _BEST_PROMPT = """\
 You are selecting the best sketch-to-shoe rendering result.
 
-IMAGE 1 is the ORIGINAL SKETCH — the designer's intended shoe design.
-IMAGE 2 shows {n} candidate photorealistic renderings side by side, labeled \
-Option 1 through Option {n} from left to right.
+The first image is the ORIGINAL SKETCH — the designer's intended shoe design.
+The second image shows {n} candidate photorealistic renderings side by side, \
+labeled Option 1 through Option {n} from left to right.
 
 Which option best represents the shoe design from the sketch in a \
 professional product photograph style?
@@ -275,8 +309,8 @@ def make_sketch_judge(
 
     prev_lowest_attr: list[str | None] = [None]
     stale_count: list[int] = [0]
-    prev_feedback: list[str] = [""]
-    score_format = ", ".join(f"{f}=N" for f in features)
+    score_format = ", ".join(f"{f}=[1-5]" for f in features)
+    example_format = ", ".join(f"{f}=3" for f in features)
 
     def judge(context: dict[str, Media]) -> tuple[bool, str]:
         sketch = context.get(sketch_key)
@@ -290,8 +324,23 @@ def make_sketch_judge(
         iteration = context.get("loop_iteration", 0)
         max_iterations = context.get("loop_max_iterations", 5)
 
-        iteration_context = f"This is attempt {iteration + 1} of {max_iterations}.\n"
-        previous_feedback = f"Previous feedback: \"{prev_feedback[0]}\"\n" if prev_feedback[0] else ""
+        if iteration == 0:
+            result_description = (
+                "a first attempt at converting the sketch into a photorealistic shoe photo."
+            )
+            iteration_context = (
+                f"This is the first rendering (1 of {max_iterations}). "
+                f"Check how well the generated photo captures the sketch's design.\n"
+            )
+        else:
+            result_description = (
+                "a refined attempt that should more closely follow the sketch than before."
+            )
+            iteration_context = (
+                f"This is refinement attempt {iteration + 1} of {max_iterations}. "
+                f"Check whether this iteration improved fidelity to the sketch.\n"
+            )
+
         stale_nudge = ""
         if stale_count[0] >= 2 and prev_lowest_attr[0]:
             attr = prev_lowest_attr[0]
@@ -302,11 +351,12 @@ def make_sketch_judge(
             )
 
         prompt_text = _SKETCH_SCORE_PROMPT.format(
+            result_description=result_description,
             iteration_context=iteration_context,
-            previous_feedback=previous_feedback,
             stale_nudge=stale_nudge,
             features=", ".join(features),
             score_format=score_format,
+            example_format=example_format,
         )
 
         bundle = MediaBundle(items={
@@ -323,9 +373,13 @@ def make_sketch_judge(
             for attempt in range(_MAX_RETRIES + 1):
                 if attempt > 0 and last_error:
                     retry_prompt = (
-                        f"{prompt_text}\n\nYour previous response could not be parsed. "
-                        f"Error: {last_error}\nPlease reply in the exact format:\n"
-                        f"SCORES: {score_format}\nREPAIR: ..."
+                        f"{prompt_text}\n\n"
+                        f"Your previous response could not be parsed ({last_error}).\n"
+                        f"You MUST replace every [1-5] with an actual integer. "
+                        f"Do not output [1-5] literally.\n"
+                        f"Correct example:\n"
+                        f"SCORES: {example_format}\n"
+                        f"REPAIR: ..."
                     )
                     bundle = MediaBundle(items={
                         "sketch": sketch,
@@ -348,7 +402,6 @@ def make_sketch_judge(
                     else:
                         prev_lowest_attr[0] = lowest_attr
                         stale_count[0] = 1
-                    prev_feedback[0] = repair
 
                     context["_judge_metadata_sketch"] = {
                         "scores": scores,
@@ -373,8 +426,7 @@ def make_sketch_judge(
                           f"(attempt {attempt + 1}/{_MAX_RETRIES + 1})")
 
             print("  [Sketch Judge] Fallback: treating unparseable response as REJECT")
-            prev_feedback[0] = raw_response or "Could not parse VLM response."
-            return False, prev_feedback[0]
+            return False, raw_response or "Could not parse VLM response."
         finally:
             session.release()
 
@@ -411,8 +463,8 @@ def make_spec_judge(
 
     prev_lowest_attr: list[str | None] = [None]
     stale_count: list[int] = [0]
-    prev_feedback: list[str] = [""]
-    score_format = ", ".join(f"{f}=N" for f in features)
+    score_format = ", ".join(f"{f}=[1-5]" for f in features)
+    example_format = ", ".join(f"{f}=3" for f in features)
 
     def judge(context: dict[str, Media]) -> tuple[bool, str]:
         candidate = context.get(candidate_key)
@@ -423,8 +475,21 @@ def make_spec_judge(
         iteration = context.get("loop_iteration", 0)
         max_iterations = context.get("loop_max_iterations", 5)
 
-        iteration_context = f"This is attempt {iteration + 1} of {max_iterations}.\n"
-        previous_feedback = f"Previous feedback: \"{prev_feedback[0]}\"\n" if prev_feedback[0] else ""
+        if iteration == 0:
+            result_description = "a first attempt at generating the shoe from the design spec."
+            iteration_context = (
+                f"This is the first rendering (1 of {max_iterations}). "
+                f"Check how well the generated photo meets each specification.\n"
+            )
+        else:
+            result_description = (
+                "a refined attempt that should better meet the specifications than before."
+            )
+            iteration_context = (
+                f"This is refinement attempt {iteration + 1} of {max_iterations}. "
+                f"Check whether this iteration improved spec compliance.\n"
+            )
+
         stale_nudge = ""
         if stale_count[0] >= 2 and prev_lowest_attr[0]:
             attr = prev_lowest_attr[0]
@@ -434,12 +499,13 @@ def make_spec_judge(
             )
 
         prompt_text = _SPEC_SCORE_PROMPT.format(
+            result_description=result_description,
             spec_text=spec_text,
             iteration_context=iteration_context,
-            previous_feedback=previous_feedback,
             stale_nudge=stale_nudge,
             features=", ".join(features),
             score_format=score_format,
+            example_format=example_format,
         )
 
         bundle = MediaBundle(items={
@@ -455,9 +521,13 @@ def make_spec_judge(
             for attempt in range(_MAX_RETRIES + 1):
                 if attempt > 0 and last_error:
                     retry_prompt = (
-                        f"{prompt_text}\n\nYour previous response could not be parsed. "
-                        f"Error: {last_error}\nPlease reply in the exact format:\n"
-                        f"SCORES: {score_format}\nREPAIR: ..."
+                        f"{prompt_text}\n\n"
+                        f"Your previous response could not be parsed ({last_error}).\n"
+                        f"You MUST replace every [1-5] with an actual integer. "
+                        f"Do not output [1-5] literally.\n"
+                        f"Correct example:\n"
+                        f"SCORES: {example_format}\n"
+                        f"REPAIR: ..."
                     )
                     bundle = MediaBundle(items={
                         "candidate": candidate,
@@ -479,7 +549,6 @@ def make_spec_judge(
                     else:
                         prev_lowest_attr[0] = lowest_attr
                         stale_count[0] = 1
-                    prev_feedback[0] = repair
 
                     context["_judge_metadata_spec"] = {
                         "scores": scores,
@@ -504,8 +573,7 @@ def make_spec_judge(
                           f"(attempt {attempt + 1}/{_MAX_RETRIES + 1})")
 
             print("  [Spec Judge] Fallback: treating unparseable response as REJECT")
-            prev_feedback[0] = raw_response or "Could not parse VLM response."
-            return False, prev_feedback[0]
+            return False, raw_response or "Could not parse VLM response."
         finally:
             session.release()
 
@@ -544,8 +612,21 @@ def make_dual_judge(
             "spec_lowest_attr": meta2.get("lowest_attr"),
         }
 
+        iteration = context.get("loop_iteration", 0)
+        if iteration == 0:
+            framing = (
+                "The shoe was generated but does not yet fully match the sketch and "
+                "specifications. Refine it — do not start over from scratch. "
+            )
+        else:
+            framing = (
+                "The previous refinement still does not fully meet the design requirements. "
+                "Continue improving the existing rendering. "
+            )
+
         combined_feedback = (
-            f"[Sketch feedback]: {feedback1}\n"
+            f"{framing}"
+            f"[Sketch feedback]: {feedback1} "
             f"[Spec feedback]: {feedback2}"
         )
         return accepted1 and accepted2, combined_feedback

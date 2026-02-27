@@ -10,6 +10,7 @@ build/
 *.safetensors
 .conda_env/
 models/
+data/
 
 .env.example
 

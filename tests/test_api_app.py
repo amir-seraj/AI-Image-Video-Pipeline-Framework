@@ -90,3 +90,78 @@ def test_generate_returns_job_id(client: TestClient):
     assert resp.status_code == 202
     assert "job_id" in resp.json()
     assert "generation_id" in resp.json()
+
+
+# ── Collection tests ─────────────────────────────────────────
+
+
+def test_create_collection(client: TestClient):
+    resp = client.post("/api/collections", json={"name": "Summer 2026"})
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["name"] == "Summer 2026"
+    assert "id" in data
+    assert data["product_ids"] == []
+
+
+def test_list_collections(client: TestClient):
+    client.post("/api/collections", json={"name": "A"})
+    client.post("/api/collections", json={"name": "B"})
+    resp = client.get("/api/collections")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+
+def test_get_collection(client: TestClient):
+    create_resp = client.post("/api/collections", json={"name": "Test"})
+    cid = create_resp.json()["id"]
+    resp = client.get(f"/api/collections/{cid}")
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "Test"
+
+
+def test_delete_collection(client: TestClient):
+    create_resp = client.post("/api/collections", json={"name": "Delete Me"})
+    cid = create_resp.json()["id"]
+    resp = client.delete(f"/api/collections/{cid}")
+    assert resp.status_code == 204
+    assert client.get(f"/api/collections/{cid}").status_code == 404
+
+
+def test_delete_collection_not_found(client: TestClient):
+    resp = client.delete("/api/collections/nonexistent")
+    assert resp.status_code == 404
+
+
+def test_add_product_to_collection(client: TestClient):
+    col = client.post("/api/collections", json={"name": "Col"}).json()
+    prod = client.post("/api/products", json={"name": "Shoe"}).json()
+    resp = client.post(
+        f"/api/collections/{col['id']}/products",
+        json={"product_id": prod["id"]},
+    )
+    assert resp.status_code == 200
+    assert prod["id"] in resp.json()["product_ids"]
+
+
+def test_add_invalid_product_to_collection(client: TestClient):
+    col = client.post("/api/collections", json={"name": "Col"}).json()
+    resp = client.post(
+        f"/api/collections/{col['id']}/products",
+        json={"product_id": "nonexistent"},
+    )
+    assert resp.status_code == 404
+
+
+def test_remove_product_from_collection(client: TestClient):
+    col = client.post("/api/collections", json={"name": "Col"}).json()
+    prod = client.post("/api/products", json={"name": "Shoe"}).json()
+    client.post(
+        f"/api/collections/{col['id']}/products",
+        json={"product_id": prod["id"]},
+    )
+    resp = client.delete(
+        f"/api/collections/{col['id']}/products/{prod['id']}"
+    )
+    assert resp.status_code == 200
+    assert prod["id"] not in resp.json()["product_ids"]

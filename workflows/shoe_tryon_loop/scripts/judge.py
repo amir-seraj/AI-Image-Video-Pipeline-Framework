@@ -30,13 +30,12 @@ Your job: for each listed attribute, score how closely the shoes on the \
 person's feet match the same attribute in the reference shoe.
 
 {iteration_context}\
-{previous_feedback}\
 {stale_nudge}\
 Scoring scale:
   1 = completely different from the reference
   2 = vaguely similar but clearly wrong
   3 = same general type but noticeable differences
-  4 = close match with only minor differences
+  4 = close match with minor differences
   5 = identical match
 
 Attributes to score: {features}
@@ -47,10 +46,10 @@ score 5 only if both feet wear identical shoes that match the reference.
 
 Reply in this exact format. Replace each [1-5] with your actual integer score:
 SCORES: {score_format}
-REPAIR: <for every attribute that scored below 5, describe the exact \
-mismatch — what you see on the person's feet vs. what the reference shoe \
-shows for that attribute. Be specific: name the attribute and describe \
-what is different>
+REPAIR: <Look at the CURRENT image. Do NOT copy the previous issues verbatim. \
+For each attribute scored below 5, describe what you actually see NOW vs. the reference. \
+If a previously-identified issue has been RESOLVED in this image, say so explicitly. \
+If it persists, describe the exact mismatch you see in the current image.>
 
 Example of a correctly filled response (scores are illustrative):
 SCORES: {example_format}
@@ -68,22 +67,26 @@ So every tag must be specific and verifiable — "red patent leather" is \
 verifiable; "nice material" is not.
 
 Cover every visible dimension — record the concrete value you observe, \
-not just the category name:
+not just the category name. Do NOT include any numbers or measurements \
+(no centimeters, no estimates like "~10cm") — use descriptive terms only \
+(e.g. "thin", "high", "chunky", "thick"). Only extract EXTERIOR features \
+visible when the shoe is worn on a foot — do NOT include interior features \
+(lining, insole, brand label) that would be hidden while worn:
 - Type / silhouette  (e.g. "stiletto pump", "over-the-knee boot", "platform mule")
 - Color(s) / pattern  (e.g. "deep burgundy", "zebra print", "two-tone black and white")
 - Material / texture  (e.g. "croc-embossed patent leather", "shearling lining", "mesh upper")
-- Heel  (e.g. "clear lucite stiletto ~12cm", "stacked wooden block heel ~5cm", "flat")
+- Heel  (e.g. "clear lucite stiletto heel", "stacked wooden block heel", "flat")
 - Toe  (e.g. "extreme pointed toe", "open square toe", "closed almond toe")
 - Closure / straps  (e.g. "criss-cross ankle lacing", "elasticated strap", "side zip")
-- Sole / platform  (e.g. "transparent platform ~4cm", "rubber lug sole", "thin leather sole")
+- Sole / platform  (e.g. "transparent platform sole", "rubber lug sole", "thin leather sole")
 - Hardware / details  (e.g. "oversized gold chain trim", "crystal toe cap", "logo plate")
 
 Reply with ONLY a JSON array of 6–10 descriptor strings. \
 No explanation, no markdown — just the array.
 
 Example:
-["deep red croc-embossed patent leather pump", "clear lucite stiletto heel ~12cm", \
-"transparent platform sole ~4cm", "open square toe", \
+["deep red croc-embossed patent leather pump", "clear lucite stiletto heel", \
+"transparent platform sole", "open square toe", \
 "ankle wrap lacing with gold rings", "gold hardware throughout"]
 """
 
@@ -350,7 +353,6 @@ def make_judge(
     # Closure state for stale guardrail
     prev_lowest_attr: list[str | None] = [None]
     stale_count: list[int] = [0]
-    prev_feedback: list[str] = [""]
 
     # Use [1-5] as placeholder — unambiguous for VLMs (N was being echoed literally)
     score_format = ", ".join(f"{f}=[1-5]" for f in features)
@@ -380,10 +382,6 @@ def make_judge(
                 f"Check whether the shoes are a closer match than in the previous comparison.\n"
             )
 
-        previous_feedback = ""
-        if prev_feedback[0]:
-            previous_feedback = f"Previous feedback: \"{prev_feedback[0]}\"\n"
-
         stale_nudge = ""
         if stale_count[0] >= 2 and prev_lowest_attr[0]:
             attr = prev_lowest_attr[0]
@@ -396,7 +394,6 @@ def make_judge(
 
         prompt_text = _SCORE_PROMPT.format(
             iteration_context=iteration_context,
-            previous_feedback=previous_feedback,
             stale_nudge=stale_nudge,
             features=", ".join(features),
             score_format=score_format,
@@ -449,8 +446,6 @@ def make_judge(
                         prev_lowest_attr[0] = lowest_attr
                         stale_count[0] = 1
 
-                    prev_feedback[0] = repair
-
                     # Frame feedback for the generation model
                     if iteration == 0:
                         generation_feedback = (
@@ -491,9 +486,7 @@ def make_judge(
                           f"(attempt {attempt + 1}/{_MAX_RETRIES + 1})")
 
             print(f"  [VLM Judge] Fallback: treating unparseable response as REJECT")
-            fallback = raw_response or "Could not parse VLM response."
-            prev_feedback[0] = fallback
-            return False, fallback
+            return False, raw_response or "Could not parse VLM response."
         finally:
             session.release()
 

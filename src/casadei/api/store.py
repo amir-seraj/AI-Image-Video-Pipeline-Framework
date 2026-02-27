@@ -4,7 +4,7 @@ import json
 import threading
 from pathlib import Path
 
-from .models import Product
+from .models import Collection, Product
 
 
 class JsonStore:
@@ -14,6 +14,7 @@ class JsonStore:
         self._path = Path(path)
         self._lock = threading.Lock()
         self._products: dict[str, Product] = {}
+        self._collections: dict[str, Collection] = {}
         if self._path.exists():
             self._load()
 
@@ -23,6 +24,10 @@ class JsonStore:
             pid: Product.model_validate(data)
             for pid, data in raw.get("products", {}).items()
         }
+        self._collections = {
+            cid: Collection.model_validate(data)
+            for cid, data in raw.get("collections", {}).items()
+        }
 
     def _flush(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -30,7 +35,11 @@ class JsonStore:
             "products": {
                 pid: p.model_dump(mode="json")
                 for pid, p in self._products.items()
-            }
+            },
+            "collections": {
+                cid: c.model_dump(mode="json")
+                for cid, c in self._collections.items()
+            },
         }
         self._path.write_text(json.dumps(raw, indent=2, default=str))
 
@@ -51,6 +60,29 @@ class JsonStore:
         with self._lock:
             if product_id in self._products:
                 del self._products[product_id]
+                self._flush()
+                return True
+            return False
+
+    # --- Collections ---
+
+    def save_collection(self, collection: Collection) -> None:
+        with self._lock:
+            self._collections[collection.id] = collection
+            self._flush()
+
+    def get_collection(self, collection_id: str) -> Collection | None:
+        with self._lock:
+            return self._collections.get(collection_id)
+
+    def list_collections(self) -> list[Collection]:
+        with self._lock:
+            return list(self._collections.values())
+
+    def delete_collection(self, collection_id: str) -> bool:
+        with self._lock:
+            if collection_id in self._collections:
+                del self._collections[collection_id]
                 self._flush()
                 return True
             return False

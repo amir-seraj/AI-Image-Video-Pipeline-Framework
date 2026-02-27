@@ -46,9 +46,17 @@ from judge import (
 IMAGE_DIR = Path(__file__).parent / "Image"
 OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_loop"
 
+VLM_MODELS = {
+    "8b":  "qwen3_vl_8b",
+    "30b": "qwen3_vl_30b",
+}
+
 PROMPT_TEMPLATE = (
-    "The image shows a shoe design sketch. Convert it into a professional, "
-    "photorealistic product photograph of the final shoe.\n\n"
+    "The first image is the original shoe design sketch — the reference for the "
+    "shoe's shape, structure, and design elements. "
+    "The second image shows the current version of the shoe rendering. "
+    "Generate a professional photorealistic product photograph of this shoe design, "
+    "faithfully following the sketch.\n\n"
     "Design specifications:\n"
     "- Material: $material\n"
     "- Color: $color\n"
@@ -163,8 +171,8 @@ def build_pipeline(
         name="firered_generate",
         agent=firered_agent,
         input_map={
-            "image": "sketch",    # IMAGE 1: sketch grid (constant reference)
-            "image_2": "image",   # IMAGE 2: last result (first iter: seeded with sketch)
+            "image": "sketch",    # always the original sketch (first image, constant reference)
+            "image_2": "image",   # first iter: sketch (seeded); subsequent: last generation
         },
         output_map={"image": "image"},
         template_kwargs={
@@ -352,6 +360,8 @@ def main():
         choices=["generous", "moderate", "strict"])
     parser.add_argument("--spacing", type=int, default=20,
         help="Pixel spacing between sketches in grid (default: 20)")
+    parser.add_argument("--vlm", type=str, default="8b", choices=["8b", "30b"],
+        help="VLM model size for judging (default: 8b)")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -371,6 +381,7 @@ def main():
     print(f"Memory mode: {'keep-both' if args.keep_both else 'swap'}")
     print(f"Scale: {args.scale}x")
     print(f"Tolerance: {args.tolerance}")
+    print(f"VLM: Qwen3-VL-{args.vlm.upper()}")
     print()
 
     raw_sketches = []
@@ -394,7 +405,7 @@ def main():
         "extra": extra_spec,
     }
 
-    vlm_session = VLMSession("qwen3_vl_8b")
+    vlm_session = VLMSession(VLM_MODELS[args.vlm])
     sketch_media = ImageMedia(image=sketch_grid)
 
     print("Extracting sketch design features...")

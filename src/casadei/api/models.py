@@ -46,16 +46,58 @@ class Generation(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class Variation(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    material: str = ""
+    color: str = ""
+    note: str = ""
+    pipeline: str = ""
+    num_outputs: int = 1
+    results: list[ResultFile] = []
+    status: JobStatus = JobStatus.pending
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class Product(BaseModel):
     id: str = Field(default_factory=_new_id)
     name: str
+    label: str = ""
+    description: str = ""
     sketches: list[Sketch] = []
     generations: list[Generation] = []
+    variations: list[Variation] = []
     created_at: datetime = Field(default_factory=_utcnow)
 
 
 class CreateProductRequest(BaseModel):
     name: str
+
+
+class CreateVariationRequest(BaseModel):
+    material: str = ""
+    color: str = ""
+    note: str = ""
+    pipeline: str
+    num_outputs: int = 1
+
+
+class RegenerateVariationRequest(BaseModel):
+    change_request: str = ""
+
+
+class Collection(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    name: str
+    product_ids: list[str] = []
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class CreateCollectionRequest(BaseModel):
+    name: str
+
+
+class AddProductToCollectionRequest(BaseModel):
+    product_id: str
 
 
 class GenerateRequest(BaseModel):
