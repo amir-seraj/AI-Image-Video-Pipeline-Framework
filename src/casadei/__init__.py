@@ -10,6 +10,7 @@ from casadei.models.base import (
     ImageConstraint, TextConstraint, VideoConstraint,
 )
 from casadei.models.image_edit import ImageEditModel
+from casadei.models.image_to_multiview import ImageToMultiViewModel
 from casadei.models.image_to_video import ImageToVideoModel
 from casadei.models.video_edit import VideoEditModel
 from casadei.models.reference_inpaint import ReferenceInpaintModel
@@ -34,6 +35,7 @@ __all__ = [
     "AIModel", "ModelCapability", "MediaConstraint",
     "ImageConstraint", "TextConstraint", "VideoConstraint",
     "ImageEditModel",
+    "ImageToMultiViewModel",
     "ImageToVideoModel",
     "VideoEditModel",
     "ReferenceInpaintModel",
