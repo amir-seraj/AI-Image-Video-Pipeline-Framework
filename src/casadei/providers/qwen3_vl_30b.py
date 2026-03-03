@@ -86,6 +86,10 @@ class Qwen3VL30B(VisionLanguageModel):
 
     30B-parameter MoE model (~3B active per token).
     Accepts images and a text prompt, produces a text response.
+
+    Token limits:
+      - Max context (input + output): 262,144 tokens
+      - Max output (DEFAULT_PARAMS): 1,024 tokens — override via max_new_tokens
     """
 
     capability = ModelCapability(

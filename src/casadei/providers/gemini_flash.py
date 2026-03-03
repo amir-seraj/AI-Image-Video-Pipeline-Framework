@@ -1,0 +1,111 @@
+"""Gemini 3 Flash vision-language model provider.
+
+Google's API-based multimodal model. No local weights —
+requires GEMINI_API_KEY environment variable.
+
+Model code: gemini-3-flash-preview
+Input: 0–14 images + text prompt
+Output: text response
+
+Context window: 1M input tokens / 64k output tokens
+Knowledge cutoff: January 2025
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterator
+
+from PIL import Image as PILImage
+
+from casadei.models.base import ModelCapability, ImageConstraint, TextConstraint
+from casadei.models.vision_language import VisionLanguageModel
+
+try:
+    from google import genai
+except ImportError:
+    genai = None
+
+logger = logging.getLogger(__name__)
+
+MODEL_ID = "gemini-3-flash-preview"
+
+
+class GeminiFlash(VisionLanguageModel):
+    """Google Gemini 3 Flash — API-based vision-language model.
+
+    Accepts up to 14 images and a text prompt, produces a text response.
+    Reads GEMINI_API_KEY from the environment via the google-genai SDK.
+    No local model weights or GPU required.
+
+    Context window: 1M input tokens / 64k output tokens.
+    Knowledge cutoff: January 2025.
+    """
+
+    MODEL_ID = MODEL_ID
+
+    capability = ModelCapability(
+        inputs=[
+            ImageConstraint(
+                required=False,
+                max_count=14,
+                supported_formats=["png", "jpg", "jpeg", "webp"],
+            ),
+            TextConstraint(required=True, max_count=1),
+        ],
+        outputs=[
+            TextConstraint(required=True, max_count=1),
+        ],
+    )
+
+    DEFAULT_PARAMS: dict = {}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._client = None
+
+    def load_model(self) -> None:
+        if genai is None:
+            raise ImportError(
+                "google-genai is required. Install: pip install google-genai"
+            )
+        self._client = genai.Client()
+        logger.info("Gemini client initialized (model: %s)", self.MODEL_ID)
+
+    def unload_model(self) -> None:
+        self._client = None
+
+    def _generate_text(
+        self,
+        images: list[PILImage.Image],
+        prompt: str,
+        **kwargs,
+    ) -> str:
+        if self._client is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        contents = [prompt] + images
+
+        response = self._client.models.generate_content(
+            model=self.MODEL_ID,
+            contents=contents,
+        )
+        return response.text or ""
+
+    def _generate_text_streaming(
+        self,
+        images: list[PILImage.Image],
+        prompt: str,
+        **kwargs,
+    ) -> Iterator[str]:
+        if self._client is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        contents = [prompt] + images
+
+        for chunk in self._client.models.generate_content_stream(
+            model=self.MODEL_ID,
+            contents=contents,
+        ):
+            if chunk.text:
+                yield chunk.text

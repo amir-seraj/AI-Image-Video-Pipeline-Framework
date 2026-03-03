@@ -1,30 +1,36 @@
-"""Sketch-to-shoe agentic loop — integration runner.
+"""Sketch-to-shoe agentic loop — Gemini version.
 
 Converts design sketches + spec (material, color, camera angle, extras) into
-a photorealistic studio product photograph using FireRed + dual VLM judges.
+a photorealistic studio product photograph using Gemini Flash Image Edit
+for generation and Gemini Flash VLM for dual judgment (sketch fidelity +
+spec compliance). Both models are API-based (no GPU required).
+Reads GEMINI_API_KEY from the .env file.
 
 Usage:
-    python tests/run_sketch_to_shoe_loop.py --sketches tests/Image/sketch001.png
-    python tests/run_sketch_to_shoe_loop.py \\
+    python tests/run_sketch_to_shoe_gemini.py --sketches tests/Image/sketch001.png
+    python tests/run_sketch_to_shoe_gemini.py \\
         --sketches s1.png s2.png \\
         --material suede --color beige --camera-angle "3/4 view" \\
         --spec style=elegant note="chunky platform"
-    python tests/run_sketch_to_shoe_loop.py --max-iter 3 --steps 20
+    python tests/run_sketch_to_shoe_gemini.py --max-iter 3 --tolerance moderate
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import math
+import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-import torch
+from dotenv import load_dotenv
 from PIL import Image as PILImage
+
+# Load .env so GEMINI_API_KEY is available before any genai import
+load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "workflows" / "sketch_to_shoe" / "scripts"))
@@ -44,13 +50,7 @@ from judge import (
 )
 
 IMAGE_DIR = Path(__file__).parent / "Image"
-OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_loop"
-
-VLM_MODELS = {
-    "8b":  "qwen3_vl_8b",
-    "8b-thinking": "qwen3_vl_8b_thinking",
-    "30b": "qwen3_vl_30b",
-}
+OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_gemini"
 
 PROMPT_TEMPLATE = (
     "The first image is the original shoe design sketch — the reference for the "
@@ -77,13 +77,7 @@ def _build_sketch_grid(
     images: list[PILImage.Image],
     spacing: int = 20,
 ) -> PILImage.Image:
-    """Arrange sketch images in a rectangular grid, then pad to square.
-
-    1. Compute grid dimensions: cols = ceil(sqrt(n)), rows = ceil(n / cols).
-    2. Common cell size = max width x max height across all inputs.
-    3. Paste tiles with `spacing` px white gaps (also used as outer border).
-    4. If resulting grid is not square, center on a white square canvas.
-    """
+    """Arrange sketch images in a rectangular grid, then pad to square."""
     if not images:
         raise ValueError("No sketch images provided.")
 
@@ -120,7 +114,7 @@ def _build_sketch_grid(
 # ---------------------------------------------------------------------------
 
 def _parse_spec_args(spec_list: list[str]) -> dict[str, str]:
-    """Parse KEY=VALUE strings from --spec CLI args. Ignores entries without '='."""
+    """Parse KEY=VALUE strings from --spec CLI args."""
     result = {}
     for item in spec_list:
         if "=" in item:
@@ -144,36 +138,31 @@ def build_pipeline(
     sketch_media: ImageMedia,
     spec: dict,
     max_iterations: int = 5,
-    num_inference_steps: int = 30,
-    swap_models: bool = True,
     vlm_session: VLMSession | None = None,
     sketch_features: list[str] | None = None,
     tolerance: str = "strict",
 ) -> Pipeline:
-    """Build the iterative sketch-to-shoe pipeline."""
+    """Build the iterative sketch-to-shoe pipeline using Gemini models."""
     if vlm_session is None:
-        vlm_session = VLMSession("qwen3_vl_8b")
+        vlm_session = VLMSession("gemini_flash")
 
     extra_specs_text = _build_extra_specs_text(spec.get("extra", {}))
 
-    firered_agent = Agent(AgentConfig(
-        name="firered_sketch_to_shoe",
-        model="firered_image_edit",
-        description="FireRed sketch-to-shoe with dual-judge feedback repair",
+    gemini_agent = Agent(AgentConfig(
+        name="gemini_sketch_to_shoe",
+        model="gemini_flash_image_edit",
+        description="Gemini Flash image edit for sketch-to-shoe generation",
         prompt_template=PROMPT_TEMPLATE,
-        negative_prompt=(
-            "blurry, distorted, low quality, sketch, drawing, illustration, flat, cartoon, "
-            "dark background, cluttered background, bad lighting, overexposed, underexposed"
-        ),
-        params={"num_inference_steps": num_inference_steps},
+        negative_prompt="",
+        params={},
     ))
 
-    firered_step = AgentStep(
-        name="firered_generate",
-        agent=firered_agent,
+    edit_step = AgentStep(
+        name="gemini_generate",
+        agent=gemini_agent,
         input_map={
-            "image": "sketch",    # always the original sketch (first image, constant reference)
-            "image_2": "image",   # first iter: sketch (seeded); subsequent: last generation
+            "image": "sketch",  # always the original sketch (constant reference)
+            "image_2": "image", # first iter: sketch (seeded); subsequent: last generation
         },
         output_map={"image": "image"},
         template_kwargs={
@@ -210,7 +199,7 @@ def build_pipeline(
 
     loop = LoopStep(
         name="sketch_to_shoe_loop",
-        body=[firered_step],
+        body=[edit_step],
         judge=dual_judge,
         max_iterations=max_iterations,
         best_fn=make_best_fn(
@@ -218,12 +207,12 @@ def build_pipeline(
             sketch_key="sketch",
             output_key="image",
         ),
-        swap_models=swap_models,
+        swap_models=True,
         output_key="image",
         feedback_template_var="feedback",
     )
 
-    return Pipeline(name="sketch_to_shoe", steps=[loop])
+    return Pipeline(name="sketch_to_shoe_gemini", steps=[loop])
 
 
 # ---------------------------------------------------------------------------
@@ -238,18 +227,19 @@ def save_results(
     final_img: ImageMedia | None,
     spec: dict,
     total_elapsed: float,
-    peak_gb: float,
     sketch_features: list[str] | None = None,
     tolerance: str = "strict",
 ) -> None:
-    """Save all results, intermediates, and metrics to run_dir."""
     run_dir.mkdir(parents=True, exist_ok=True)
     sketch_grid.save(run_dir / "input_sketch_grid.png")
 
     results_data = {
         "timestamp": datetime.now().isoformat(),
         "total_elapsed_s": total_elapsed,
-        "peak_vram_gb": peak_gb,
+        "models": {
+            "image_edit": "gemini_flash_image_edit",
+            "vlm_judge": "gemini_flash",
+        },
         "spec": spec,
         "sketch_features": sketch_features or [],
         "tolerance": tolerance,
@@ -300,11 +290,12 @@ def save_results(
     )
 
     lines = [
-        "Sketch-to-Shoe Loop Results",
+        "Sketch-to-Shoe Loop Results — Gemini",
         "=" * 60,
         f"Date: {datetime.now().isoformat()}",
         f"Total time: {total_elapsed:.1f}s",
-        f"Peak VRAM: {peak_gb:.2f} GB",
+        f"Image edit model: gemini_flash_image_edit",
+        f"VLM judge model:  gemini_flash",
         f"Material: {spec.get('material')}  Color: {spec.get('color')}  Angle: {spec.get('camera_angle')}",
         f"Sketch features: {sketch_features or []}",
         f"Tolerance: {tolerance}",
@@ -339,7 +330,9 @@ def save_results(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Sketch-to-shoe agentic loop")
+    parser = argparse.ArgumentParser(
+        description="Sketch-to-shoe agentic loop — Gemini Flash (image edit + VLM judge)"
+    )
     parser.add_argument("--sketches", type=str, nargs="+", required=True,
         help="Path(s) to sketch image(s)")
     parser.add_argument("--material", type=str, default="leather",
@@ -353,36 +346,31 @@ def main():
         metavar="KEY=VALUE",
         help="Open-ended extras, e.g. style=elegant note='chunky sole'")
     parser.add_argument("--max-iter", type=int, default=5)
-    parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--keep-both", action="store_true",
-        help="Keep all models loaded (needs ~74GB+ VRAM)")
-    parser.add_argument("--scale", type=float, default=1.0)
-    parser.add_argument("--tolerance", type=str, default="strict",
+    parser.add_argument("--tolerance", type=str, default="moderate",
         choices=["generous", "moderate", "strict"])
+    parser.add_argument("--scale", type=float, default=1.0,
+        help="Scale factor for sketch images (default: 1.0)")
     parser.add_argument("--spacing", type=int, default=20,
         help="Pixel spacing between sketches in grid (default: 20)")
-    parser.add_argument("--vlm", type=str, default="8b", choices=list(VLM_MODELS),
-        help="VLM model size for judging (default: 8b)")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        print("CUDA not available. Exiting.")
+    if not os.environ.get("GEMINI_API_KEY"):
+        print("Error: GEMINI_API_KEY not set. Add it to your .env file.")
         return
 
-    print("=== Sketch-to-Shoe Agentic Loop ===")
-    print(f"Sketches: {args.sketches}")
-    print(f"Material: {args.material}")
-    print(f"Color: {args.color}")
-    print(f"Camera angle: {args.camera_angle}")
+    print("=== Sketch-to-Shoe Agentic Loop — Gemini ===")
+    print(f"Sketches:      {args.sketches}")
+    print(f"Material:      {args.material}")
+    print(f"Color:         {args.color}")
+    print(f"Camera angle:  {args.camera_angle}")
     extra_spec = _parse_spec_args(args.spec)
     if extra_spec:
-        print(f"Extra spec: {extra_spec}")
-    print(f"Max iterations: {args.max_iter}")
-    print(f"Inference steps: {args.steps}")
-    print(f"Memory mode: {'keep-both' if args.keep_both else 'swap'}")
-    print(f"Scale: {args.scale}x")
-    print(f"Tolerance: {args.tolerance}")
-    print(f"VLM: Qwen3-VL-{args.vlm.upper()}")
+        print(f"Extra spec:    {extra_spec}")
+    print(f"Max iterations:{args.max_iter}")
+    print(f"Tolerance:     {args.tolerance}")
+    print(f"Scale:         {args.scale}x")
+    print(f"Image edit:    gemini_flash_image_edit (Nano Banana 2)")
+    print(f"VLM judge:     gemini_flash (Gemini 3 Flash)")
     print()
 
     raw_sketches = []
@@ -406,7 +394,7 @@ def main():
         "extra": extra_spec,
     }
 
-    vlm_session = VLMSession(VLM_MODELS[args.vlm])
+    vlm_session = VLMSession("gemini_flash")
     sketch_media = ImageMedia(image=sketch_grid)
 
     print("Extracting sketch design features...")
@@ -418,8 +406,6 @@ def main():
         sketch_media=sketch_media,
         spec=spec,
         max_iterations=args.max_iter,
-        num_inference_steps=args.steps,
-        swap_models=not args.keep_both,
         vlm_session=vlm_session,
         sketch_features=sketch_features,
         tolerance=args.tolerance,
@@ -431,12 +417,6 @@ def main():
         "image": sketch_media,  # seed for first iteration
     }
 
-    if args.keep_both:
-        print("Loading all models (keep-both mode)...")
-        vlm_session.load()
-        pipeline.load()
-
-    torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
 
     try:
@@ -444,9 +424,7 @@ def main():
     finally:
         vlm_session.unload()
 
-    torch.cuda.synchronize()
     total_elapsed = time.perf_counter() - t0
-    peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
 
     print(exec_log.summary())
 
@@ -454,7 +432,7 @@ def main():
     final_img = result.get("image")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = OUTPUT_DIR / f"{args.max_iter}iter_{args.steps}steps_{ts}"
+    run_dir = OUTPUT_DIR / f"{args.max_iter}iter_{ts}"
 
     save_results(
         run_dir=run_dir,
@@ -464,13 +442,10 @@ def main():
         final_img=final_img,
         spec=spec,
         total_elapsed=total_elapsed,
-        peak_gb=peak_gb,
         sketch_features=sketch_features,
         tolerance=args.tolerance,
     )
 
-    gc.collect()
-    torch.cuda.empty_cache()
     print(f"\nDone. Results saved to: {run_dir}")
 
 

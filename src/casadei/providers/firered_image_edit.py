@@ -50,6 +50,10 @@ class FireRedImageEdit(ImageEditModel):
     Built on the Qwen-Image foundation. Accepts up to 2 images and a text
     prompt, produces 1 edited image. Uses QwenImageEditPlusPipeline.
     ~58 GB in BF16.
+
+    Text prompt token limits (T5/CLIP text encoder):
+      - Max position embeddings: 128,000
+      - Tokenizer model_max_length: 131,072
     """
 
     MODEL_ID = MODEL_ID

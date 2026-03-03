@@ -1,4 +1,11 @@
-"""Qwen3-VL-8B-Instruct vision-language model provider."""
+"""Qwen3-VL-8B-Thinking vision-language model provider (non-thinking mode).
+
+Uses the Thinking model checkpoint but disables chain-of-thought via
+``enable_thinking=False`` in the chat template, producing direct responses
+without <think> blocks.
+
+Download + first run:  python src/casadei/providers/qwen3_vl_8b_thinking.py
+"""
 
 from __future__ import annotations
 
@@ -16,8 +23,8 @@ from casadei.models.vision_language import VisionLanguageModel
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-LOCAL_DIR = MODELS_DIR / "Qwen3-VL-8B-Instruct"
+MODEL_ID = "Qwen/Qwen3-VL-8B-Thinking"
+LOCAL_DIR = MODELS_DIR / "Qwen3-VL-8B-Thinking"
 
 
 def download_model() -> None:
@@ -82,8 +89,12 @@ def _fix_corrupt_configs(model_dir: Path) -> None:
             logger.warning("  Failed to download %s: %s", name, exc)
 
 
-class Qwen3VL8B(VisionLanguageModel):
-    """Qwen3-VL-8B-Instruct vision-language model.
+class Qwen3VL8BThinking(VisionLanguageModel):
+    """Qwen3-VL-8B-Thinking vision-language model running in non-thinking mode.
+
+    Uses the Thinking model checkpoint but disables chain-of-thought via
+    ``enable_thinking=False`` in the chat template, producing direct responses
+    without <think> blocks.
 
     Accepts images and a text prompt, produces a text response.
 
@@ -120,7 +131,7 @@ class Qwen3VL8B(VisionLanguageModel):
 
         _fix_corrupt_configs(LOCAL_DIR)
 
-        logger.info("Loading Qwen3-VL-8B-Instruct from %s", LOCAL_DIR)
+        logger.info("Loading Qwen3-VL-8B-Thinking (non-thinking) from %s", LOCAL_DIR)
         self._processor = Qwen3VLProcessor.from_pretrained(str(LOCAL_DIR))
         self._model = Qwen3VLForConditionalGeneration.from_pretrained(
             str(LOCAL_DIR),
@@ -128,7 +139,7 @@ class Qwen3VL8B(VisionLanguageModel):
             device_map="auto",
             attn_implementation="sdpa",
         )
-        logger.info("Qwen3-VL-8B-Instruct loaded.")
+        logger.info("Qwen3-VL-8B-Thinking loaded.")
 
     def unload_model(self) -> None:
         self._model = None
@@ -139,7 +150,7 @@ class Qwen3VL8B(VisionLanguageModel):
     def _prepare_inputs(
         self, images: list[PILImage.Image], prompt: str
     ) -> dict:
-        """Build chat messages, apply template, and tokenize."""
+        """Build chat messages, apply template with thinking disabled, and tokenize."""
         content: list[dict] = []
         for img in images:
             content.append({"type": "image", "image": img})
@@ -148,7 +159,10 @@ class Qwen3VL8B(VisionLanguageModel):
         messages = [{"role": "user", "content": content}]
 
         text_input = self._processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
         return self._processor(
             text=[text_input],

@@ -20,7 +20,7 @@ from casadei.media import ImageMedia, Media, TextMedia, MediaBundle
 # ---------------------------------------------------------------------------
 
 _SCORE_PROMPT = """\
-You are comparing shoes across two images.
+You are a strict quality inspector comparing shoes across two images.
 
 The first image is the REFERENCE SHOE — a product photo of the target shoe.
 The second image shows a PERSON WEARING SHOES — examine only the shoes \
@@ -29,14 +29,25 @@ on their feet.
 Your job: for each listed attribute, score how closely the shoes on the \
 person's feet match the same attribute in the reference shoe.
 
+IMPORTANT: The shoes on the person are AI-generated replacements. They \
+often look correct at first glance but have subtle differences in \
+proportions, trim details, strap attachment points, edge finishing, or \
+color shade. Examine each attribute at the fine-detail level, not just \
+the category level. "Both are red" does not earn a 5 — check the exact \
+shade, glossiness, and reflections.
+
 {iteration_context}\
 {stale_nudge}\
 Scoring scale:
   1 = completely different from the reference
   2 = vaguely similar but clearly wrong
-  3 = same general type but noticeable differences
-  4 = close match with minor differences
-  5 = identical match
+  3 = same general type but noticeable differences in detail
+  4 = close match with only minor differences visible on close inspection
+  5 = indistinguishable — identical shape, proportions, color shade, and \
+every visible detail
+
+A score of 5 means you cannot find ANY difference for that attribute. \
+If you can spot even one small difference, the score must be 4 or lower.
 
 Attributes to score: {features}
 
@@ -44,12 +55,17 @@ Check BOTH feet individually. For "both feet match": score 1 if the two \
 feet show different shoes (one matches the reference, the other does not); \
 score 5 only if both feet wear identical shoes that match the reference.
 
-Reply in this exact format. Replace each [1-5] with your actual integer score:
+First, describe what you observe in the reference shoe and on the \
+person's feet for each attribute. Then provide your scores.
+
+Reply in this exact format:
+OBSERVATIONS: <For each attribute, state what you see in the reference \
+vs. what you see on the person's feet. Note any differences no matter \
+how small.>
 SCORES: {score_format}
-REPAIR: <Look at the CURRENT image. Do NOT copy the previous issues verbatim. \
-For each attribute scored below 5, describe what you actually see NOW vs. the reference. \
-If a previously-identified issue has been RESOLVED in this image, say so explicitly. \
-If it persists, describe the exact mismatch you see in the current image.>
+REPAIR: <For each attribute scored below 5, describe the specific \
+mismatch between what you see on the person's feet and the reference. \
+Do NOT copy previous issues verbatim — describe what you actually see NOW.>
 
 Example of a correctly filled response (scores are illustrative):
 SCORES: {example_format}
@@ -489,6 +505,439 @@ def make_judge(
             return False, raw_response or "Could not parse VLM response."
         finally:
             session.release()
+
+    return judge
+
+
+# ---------------------------------------------------------------------------
+# Multi-Judge (specialized agents)
+# ---------------------------------------------------------------------------
+
+_MULTI_AGENT_PROMPT = """\
+You are an expert {domain} inspector comparing shoes across two images.
+
+The first image is the REFERENCE SHOE — a product photo of the target shoe.
+The second image shows a PERSON WEARING SHOES — examine only the shoes \
+on their feet.
+
+{domain_instructions}
+
+IMPORTANT: The shoes on the person are AI-generated replacements. They \
+often look correct at first glance but have subtle differences. Examine \
+each attribute at the fine-detail level, not just the category level.
+
+Scoring scale:
+  1 = completely different from the reference
+  2 = vaguely similar but clearly wrong
+  3 = same general type but noticeable differences in detail
+  4 = close match with only minor differences visible on close inspection
+  5 = indistinguishable — identical in every visible detail
+
+A score of 5 means you cannot find ANY difference for that attribute. \
+If you can spot even one small difference, the score must be 4 or lower.
+
+Attributes to score: {features}
+
+First, describe what you observe in the reference shoe and on the \
+person's feet for each attribute. Then provide your scores.
+
+Reply in this exact format:
+OBSERVATIONS: <For each attribute, state what you see in the reference \
+vs. what you see on the person's feet. Note any differences no matter \
+how small.>
+SCORES: {score_format}
+REPAIR: <For each attribute scored below 5, describe the specific \
+mismatch between what you see on the person's feet and the reference. \
+If all scores are 5, write "No issues.">
+
+Example of a correctly filled response (scores are illustrative):
+SCORES: {example_format}
+REPAIR: The shade is slightly warmer than the reference ...
+"""
+
+_SYNTHESIS_PROMPT = """\
+You are directing FireRed, an AI image editor, that will see the REFERENCE SHOE \
+image above while making edits to a generated photo.
+
+Specialist judges found these remaining issues in the generated shoe:
+{failing_reports}
+
+These aspects are already correct and must NOT be changed:
+{passing_domains}
+
+Write a short instruction (under 80 words) for FireRed. Your instruction must:
+- Point to a specific visible area of the reference shoe image
+- Say exactly what to replicate from that area
+- Confirm what is already correct and should stay unchanged
+- Sound like directions to a skilled photo retoucher, not a judge report
+
+Write only the instruction. Do not use agent category names or bullet points.
+"""
+
+
+def _synthesize_firered_prompt(
+    model,
+    reference: ImageMedia,
+    failing_agents: list[tuple[str, dict, str]],
+    passing_names: list[str],
+) -> str | None:
+    """Call VLM with the reference shoe image to produce a focused FireRed directive.
+
+    The VLM sees the reference shoe and the failing agent reports, then writes
+    a short natural-language instruction pointing FireRed at the specific parts
+    of the reference it needs to replicate more closely.
+
+    Returns None on failure (caller falls back to raw repair text).
+    """
+    if not failing_agents:
+        return None
+
+    failing_reports = "\n".join(
+        f"- {repair}"
+        for _, _, repair in failing_agents
+    )
+    passing_text = (
+        ", ".join(passing_names)
+        if passing_names
+        else "None — all aspects need improvement"
+    )
+    prompt_text = _SYNTHESIS_PROMPT.format(
+        failing_reports=failing_reports,
+        passing_domains=passing_text,
+    )
+    bundle = MediaBundle(items={
+        "reference": reference,
+        "prompt": TextMedia(text=prompt_text),
+    })
+    try:
+        result = _stream_vlm(model, bundle, label="Synthesis→FireRed")
+        return result.strip() if result.strip() else None
+    except Exception as exc:
+        print(f"  [Synthesis] Failed ({exc}), using raw repair text")
+        return None
+
+
+_MULTI_AGENTS = [
+    {
+        "name": "Color & Material",
+        "domain": "color and material",
+        "domain_instructions": (
+            "Your expertise is COLOR, PATTERN, MATERIAL, and SURFACE FINISH.\n\n"
+            "Focus on:\n"
+            "- Exact color shade (not just 'red' — is it cherry red, wine red, coral?)\n"
+            "- Color distribution and gradients across the shoe\n"
+            "- Pattern accuracy (print scale, orientation, placement)\n"
+            "- Material type (leather, suede, patent, fabric, synthetic)\n"
+            "- Surface texture (grain, weave, embossing depth)\n"
+            "- Glossiness and reflections (matte vs satin vs high-gloss)\n\n"
+            "Compare each at the pixel level. 'Both are red' is NOT sufficient — "
+            "check whether the exact shade, saturation, and surface sheen match."
+        ),
+        "features": [
+            "color shade accuracy",
+            "pattern fidelity",
+            "material type",
+            "texture and grain",
+            "glossiness and reflections",
+        ],
+    },
+    {
+        "name": "Shape & Structure",
+        "domain": "shape and structural",
+        "domain_instructions": (
+            "Your expertise is SILHOUETTE, PROPORTIONS, and STRUCTURAL GEOMETRY.\n\n"
+            "Focus on:\n"
+            "- Overall silhouette and profile shape\n"
+            "- Heel type (stiletto, block, wedge, kitten, flat)\n"
+            "- Heel height relative to the rest of the shoe\n"
+            "- Heel angle and taper\n"
+            "- Toe box shape (pointed, round, square, almond, open)\n"
+            "- Sole thickness and platform height\n"
+            "- Arch curve and instep line\n\n"
+            "Compare proportions and angles precisely. A heel that is "
+            "slightly too short or a toe box that is slightly too wide "
+            "should score below 5."
+        ),
+        "features": [
+            "silhouette and profile",
+            "heel type and height",
+            "heel angle and shape",
+            "toe shape and proportions",
+            "sole and platform",
+        ],
+    },
+    {
+        "name": "Details & Hardware",
+        "domain": "detail and hardware",
+        "domain_instructions": (
+            "Your expertise is SMALL DETAILS, HARDWARE, and DECORATIVE ELEMENTS.\n\n"
+            "Focus on:\n"
+            "- Closure type (zip, buckle, lace, slip-on, velcro)\n"
+            "- Strap count, width, placement, and routing\n"
+            "- Buckle/clasp shape, size, color, and placement\n"
+            "- Metal hardware finish (gold, silver, gunmetal, brushed, polished)\n"
+            "- Decorative trim (chains, studs, crystals, bows, logos)\n"
+            "- Edge finishing (piping, stitching, raw-cut, rolled)\n"
+            "- Seam lines and construction details\n\n"
+            "These small elements are where AI-generated shoes most often "
+            "differ from the reference. Examine attachment points, hardware "
+            "count, and decorative placement carefully."
+        ),
+        "features": [
+            "closure and straps",
+            "buckles and clasps",
+            "hardware finish and color",
+            "decorative trim",
+            "edge finishing and seams",
+        ],
+    },
+    {
+        "name": "Consistency",
+        "domain": "consistency and realism",
+        "domain_instructions": (
+            "Your expertise is LEFT-RIGHT CONSISTENCY and PLACEMENT REALISM.\n\n"
+            "Focus on:\n"
+            "- Do BOTH feet show the same shoe? Compare left foot vs right foot.\n"
+            "- Are both shoes the same color, shape, and style?\n"
+            "- Do the shoes sit naturally on the person's feet?\n"
+            "- Is the scale/size proportionate to the person's body?\n"
+            "- Do the shoes make proper contact with the ground/surface?\n"
+            "- Are there any impossible geometry artifacts (floating, clipping)?\n\n"
+            "AI-generated replacements often get one foot right and the other "
+            "wrong, or produce shoes that float or clip through the ground."
+        ),
+        "features": [
+            "both feet match",
+            "natural foot placement",
+            "scale and proportion to body",
+            "ground contact realism",
+        ],
+    },
+]
+
+
+def make_multi_judge(
+    session: VLMSession,
+    shoe_key: str = "shoe",
+    candidate_key: str = "image",
+    tolerance: str = "strict",
+) -> JudgeCallable:
+    """Return a multi-agent JudgeCallable with 4 specialized domain agents.
+
+    Each agent focuses on a narrow set of attributes (color/material,
+    shape/structure, details/hardware, consistency). Runs sequentially
+    on the same model. Scores are combined for accept/reject decision.
+    """
+    tol = TOLERANCE_CONFIGS.get(tolerance, TOLERANCE_CONFIGS["strict"])
+    avg_threshold = tol["avg_threshold"]
+    min_floor = tol["min_floor"]
+
+    # Closure state for stale guardrail
+    prev_lowest_attr: list[str | None] = [None]
+    stale_count: list[int] = [0]
+
+    def judge(context: dict[str, Media]) -> tuple[bool, str]:
+        candidate = context.get(candidate_key)
+        reference = context.get(shoe_key)
+
+        if not isinstance(candidate, ImageMedia):
+            return False, f"Missing candidate image (key='{candidate_key}')."
+        if not isinstance(reference, ImageMedia):
+            return False, f"Missing reference shoe image (key='{shoe_key}')."
+
+        iteration = context.get("loop_iteration", 0)
+
+        all_scores: dict[str, float] = {}
+        # Per-agent tracking: name -> (scores_dict, repair_text)
+        agent_results: dict[str, tuple[dict[str, float], str]] = {}
+
+        model = session.acquire()
+        try:
+            for agent_def in _MULTI_AGENTS:
+                agent_name = agent_def["name"]
+                features = agent_def["features"]
+                score_format = ", ".join(f"{f}=[1-5]" for f in features)
+                example_format = ", ".join(f"{f}=3" for f in features)
+
+                prompt_text = _MULTI_AGENT_PROMPT.format(
+                    domain=agent_def["domain"],
+                    domain_instructions=agent_def["domain_instructions"],
+                    features=", ".join(features),
+                    score_format=score_format,
+                    example_format=example_format,
+                )
+
+                bundle = MediaBundle(items={
+                    "reference": reference,
+                    "candidate": candidate,
+                    "prompt": TextMedia(text=prompt_text),
+                })
+
+                last_error = ""
+                parsed = False
+
+                for attempt in range(_MAX_RETRIES + 1):
+                    if attempt > 0 and last_error:
+                        retry_prompt = (
+                            f"{prompt_text}\n\n"
+                            f"Your previous response could not be parsed ({last_error}).\n"
+                            f"You MUST replace every [1-5] with an actual integer.\n"
+                            f"Correct example:\n"
+                            f"SCORES: {example_format}\n"
+                            f"REPAIR: ..."
+                        )
+                        bundle = MediaBundle(items={
+                            "reference": reference,
+                            "candidate": candidate,
+                            "prompt": TextMedia(text=retry_prompt),
+                        })
+
+                    raw = _stream_vlm(model, bundle, label=agent_name)
+
+                    try:
+                        scores = _parse_scores(raw)
+                        repair = _parse_repair(raw)
+                        all_scores.update(scores)
+                        agent_results[agent_name] = (scores, repair)
+                        parsed = True
+                        break
+                    except ValueError as e:
+                        last_error = str(e)
+                        print(f"  [{agent_name}] Parse error: {last_error} "
+                              f"(attempt {attempt + 1}/{_MAX_RETRIES + 1})")
+
+                if not parsed:
+                    print(f"  [{agent_name}] All attempts failed, skipping agent")
+
+            # --- Synthesis step (model still loaded) ---
+            # Run after all 4 agents while we still hold the model, so we don't
+            # need an extra load/unload cycle.
+            _FINE_TUNE_THRESHOLD = 3.8
+            synthesized_repair: str | None = None
+            if all_scores:
+                _avg_now = sum(all_scores.values()) / len(all_scores)
+
+                # Identify failing agents (same criteria as accept/reject).
+                _failing = [
+                    (name, sc, rep)
+                    for name, (sc, rep) in agent_results.items()
+                    if sc and (
+                        min(sc.values()) < min_floor
+                        or sum(sc.values()) / len(sc) < avg_threshold
+                    )
+                    and rep and rep != "No issues."
+                ]
+
+                # Fine-tune vs redo: same strategy as before, but now we feed
+                # those agents into the synthesis VLM rather than raw text.
+                if _avg_now >= _FINE_TUNE_THRESHOLD and _failing:
+                    _worst = min(
+                        _failing,
+                        key=lambda x: (min(x[1].values()), sum(x[1].values()) / len(x[1])),
+                    )
+                    _agents_for_synth = [_worst]
+                else:
+                    _agents_for_synth = _failing
+
+                _failing_names = {n for n, _, _ in _agents_for_synth}
+                _passing_names = [n for n in agent_results if n not in _failing_names]
+
+                synthesized_repair = _synthesize_firered_prompt(
+                    model, reference, _agents_for_synth, _passing_names,
+                )
+        finally:
+            session.release()
+
+        if not all_scores:
+            return False, "All judge agents failed to produce scores."
+
+        avg = sum(all_scores.values()) / len(all_scores)
+        lowest_val = min(all_scores.values())
+        lowest_attr = min(all_scores, key=all_scores.get)
+        accepted = avg >= avg_threshold and lowest_val >= min_floor
+
+        # Update stale guardrail
+        if lowest_attr == prev_lowest_attr[0]:
+            stale_count[0] += 1
+        else:
+            prev_lowest_attr[0] = lowest_attr
+            stale_count[0] = 1
+
+        # Full combined repair for logging only
+        all_repairs = [
+            f"[{name}] {repair}"
+            for name, (_, repair) in agent_results.items()
+            if repair and repair != "No issues."
+        ]
+        combined_repair = " ".join(all_repairs) if all_repairs else "No issues."
+
+        # Identify failing agents (for fallback and logging).
+        failing_agents = [
+            (name, scores, repair)
+            for name, (scores, repair) in agent_results.items()
+            if scores and (
+                min(scores.values()) < min_floor
+                or sum(scores.values()) / len(scores) < avg_threshold
+            )
+            and repair and repair != "No issues."
+        ]
+
+        # Use the VLM-synthesized directive if available, otherwise fall back
+        # to the raw repair text with the fine-tune/redo strategy.
+        if synthesized_repair:
+            focused_repair = synthesized_repair
+        else:
+            if avg >= _FINE_TUNE_THRESHOLD and failing_agents:
+                worst = min(
+                    failing_agents,
+                    key=lambda x: (
+                        min(x[1].values()),
+                        sum(x[1].values()) / len(x[1]),
+                    ),
+                )
+                focused_repair = f"[{worst[0]}] {worst[2]}"
+            else:
+                focused_repair = (
+                    " ".join(f"[{n}] {r}" for n, _, r in failing_agents)
+                    if failing_agents else "No issues."
+                )
+
+        # Frame feedback for the generation model — use focused_repair (worst agent only)
+        # not combined_repair, to avoid overwhelming FireRed with contradictory instructions
+        if iteration == 0:
+            generation_feedback = (
+                "The shoes in the second image were replaced in the previous "
+                "attempt but do not fully match the reference shoe photo yet. "
+                "Ensure BOTH feet have the correct shoe and refine to better "
+                "match the reference. "
+                f"Specifically: {focused_repair}"
+            )
+        else:
+            generation_feedback = (
+                "The previous refinement still does not fully match the "
+                "reference shoe. Continue improving the shoe match. "
+                f"Specifically: {focused_repair}"
+            )
+
+        context["_judge_metadata"] = {
+            "scores": all_scores,
+            "avg_score": round(avg, 2),
+            "lowest_score": round(lowest_val, 2),
+            "lowest_attr": lowest_attr,
+            "stale_count": stale_count[0],
+        }
+
+        verdict = "ACCEPT" if accepted else "REJECT"
+        scores_str = ", ".join(f"{k}={v}" for k, v in all_scores.items())
+        print(f"  [{verdict}] avg={avg:.1f} min={lowest_val:.1f} "
+              f"(threshold: avg>={avg_threshold}, min>={min_floor})")
+        print(f"  Scores: {scores_str}")
+        if not accepted:
+            mode = "fine-tune" if avg >= _FINE_TUNE_THRESHOLD else "redo"
+            src = "synthesized" if synthesized_repair else "raw"
+            print(f"  Repair ({mode}/{src}): {focused_repair[:300]}")
+
+        return accepted, generation_feedback
 
     return judge
 

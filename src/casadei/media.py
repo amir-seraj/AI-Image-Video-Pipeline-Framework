@@ -73,6 +73,26 @@ class TextMedia(Media):
         return TextMedia(text=template.safe_substitute(**kwargs))
 
 
+class EmbeddingMedia(Media):
+    """A list of numeric embeddings (vectors).
+
+    Stored as a list of lists of floats. Each inner list corresponds to
+    the embedding of a single document/text.
+    """
+
+    embeddings: list[list[float]]
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.embeddings)
+
+    @property
+    def dimension(self) -> int:
+        if not self.embeddings:
+            return 0
+        return len(self.embeddings[0])
+
+
 class VideoMedia(Media):
     """A video stored as file path, in-memory frames, or both.
 
@@ -140,3 +160,4 @@ class MediaBundle(Media):
 
     def __getitem__(self, key: str) -> Media:
         return self.items[key]
+

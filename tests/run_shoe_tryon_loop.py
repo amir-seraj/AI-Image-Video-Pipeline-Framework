@@ -32,13 +32,14 @@ from casadei import (
     LoggedPipeline, Pipeline,
 )
 from casadei.loop import LoopStep, LoopResult
-from judge import VLMSession, make_judge, make_best_fn, extract_features
+from judge import VLMSession, make_judge, make_multi_judge, make_best_fn, extract_features
 
 IMAGE_DIR = Path(__file__).parent / "Image"
 OUTPUT_DIR = Path(__file__).parent / "output" / "shoe_tryon_loop"
 
 VLM_MODELS = {
     "8b":  "qwen3_vl_8b",
+    "8b-thinking": "qwen3_vl_8b_thinking",
     "30b": "qwen3_vl_30b",
 }
 
@@ -241,6 +242,7 @@ def build_pipeline(
     vlm_session: VLMSession | None = None,
     features: list[str] | None = None,
     tolerance: str = "strict",
+    multi_judge: bool = False,
 ) -> Pipeline:
     """Build the iterative shoe replacement pipeline."""
     if vlm_session is None:
@@ -266,16 +268,26 @@ def build_pipeline(
         template_kwargs={"feedback": ""},
     )
 
-    loop = LoopStep(
-        name="tryon_loop",
-        body=[firered_step],
-        judge=make_judge(
+    if multi_judge:
+        judge_fn = make_multi_judge(
+            session=vlm_session,
+            shoe_key="shoe",
+            candidate_key="image",
+            tolerance=tolerance,
+        )
+    else:
+        judge_fn = make_judge(
             session=vlm_session,
             shoe_key="shoe",
             candidate_key="image",
             features=features,
             tolerance=tolerance,
-        ),
+        )
+
+    loop = LoopStep(
+        name="tryon_loop",
+        body=[firered_step],
+        judge=judge_fn,
         max_iterations=max_iterations,
         best_fn=make_best_fn(
             session=vlm_session,
@@ -455,6 +467,10 @@ def main():
         choices=["generous", "moderate", "strict"],
         help="Judge tolerance level (default: strict)",
     )
+    parser.add_argument(
+        "--multi-judge", action="store_true",
+        help="Use 4 specialized judge agents instead of one monolithic judge",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -471,6 +487,7 @@ def main():
     print(f"Scale: {args.scale}x")
     print(f"VLM: Qwen3-VL-{args.vlm.upper()}")
     print(f"Tolerance: {args.tolerance}")
+    print(f"Judge: {'multi-agent (4 specialists)' if args.multi_judge else 'single'}")
     print()
 
     # Load images
@@ -494,11 +511,15 @@ def main():
     # Create shared VLM session — pre-load in keep-both mode
     vlm_session = VLMSession(VLM_MODELS[args.vlm])
 
-    # Extract shoe features for structured judging (loads VLM briefly)
+    # Extract shoe features for structured judging (skip for multi-judge — it has fixed features)
     shoe_media = ImageMedia(image=shoes)
-    print("Extracting shoe features...")
-    features = extract_features(vlm_session, shoe_media)
-    print(f"Features: {features}")
+    if args.multi_judge:
+        features = None
+        print("Using multi-judge (4 specialized agents — skipping feature extraction)")
+    else:
+        print("Extracting shoe features...")
+        features = extract_features(vlm_session, shoe_media)
+        print(f"Features: {features}")
     print()
 
     # Build pipeline
@@ -509,6 +530,7 @@ def main():
         vlm_session=vlm_session,
         features=features,
         tolerance=args.tolerance,
+        multi_judge=args.multi_judge,
     )
     logged = LoggedPipeline(pipeline)
 

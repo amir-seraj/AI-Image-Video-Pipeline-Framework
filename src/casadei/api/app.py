@@ -41,6 +41,7 @@ from .models import (
     ResultFile,
     RunResponse,
     Sketch,
+    UpdateCollectionRequest,
     Variation,
 )
 from .store import JsonStore
@@ -1327,6 +1328,223 @@ def create_app(
 
         return {"job_id": job_id}
 
+    def _run_add_image(
+        product: Product,
+        variation: Variation,
+        job_id: str,
+        change_request: str,
+    ) -> None:
+        """Background thread: generates one more image and appends to variation results."""
+        try:
+            from casadei import (
+                Agent,
+                ImageMedia,
+                MediaBundle,
+                TextMedia,
+                load_agent,
+            )
+
+            job_manager.update_progress(job_id, 0.1, "Loading models...")
+
+            agent_name_to_yaml: dict[str, Path] = {}
+            if agents_dir.exists():
+                for yaml_file in agents_dir.glob("*.yaml"):
+                    config = load_agent(yaml_file)
+                    agent_name_to_yaml[config.name] = yaml_file
+
+            preset = None
+            for p in list_pipelines():
+                if p.id == variation.pipeline:
+                    preset = p
+                    break
+
+            if not preset:
+                job_manager.fail(
+                    job_id, f"Unknown pipeline: {variation.pipeline}"
+                )
+                variation.status = JobStatus.completed
+                store.save_product(product)
+                return
+
+            sketch_dir = uploads_dir / product.id
+            images = []
+            for sketch in product.sketches:
+                for f in sketch_dir.glob(f"{sketch.id}_*"):
+                    images.append(ImageMedia.load(f))
+
+            if not images:
+                job_manager.fail(job_id, "No sketch images found")
+                variation.status = JobStatus.completed
+                store.save_product(product)
+                return
+
+            parts = []
+            if variation.material or variation.color:
+                parts.append(
+                    f"A photorealistic {variation.material} shoe in {variation.color}."
+                )
+            if variation.note:
+                parts.append(variation.note + ".")
+            if change_request:
+                parts.append(change_request + ".")
+            prompt = " ".join(parts) if parts else "Generate a shoe design."
+
+            total_agents = len(preset.agents)
+            result_images = images
+
+            for i, agent_name in enumerate(preset.agents):
+                progress = 0.1 + (0.8 * i / total_agents)
+                job_manager.update_progress(
+                    job_id, progress, f"Running {agent_name}..."
+                )
+
+                yaml_path = agent_name_to_yaml.get(agent_name)
+                if not yaml_path:
+                    job_manager.fail(
+                        job_id, f"Agent not found: {agent_name}"
+                    )
+                    variation.status = JobStatus.completed
+                    store.save_product(product)
+                    return
+
+                agent_config = load_agent(yaml_path)
+                agent = Agent(agent_config)
+                agent.load()
+
+                try:
+                    bundle_items: dict = {"image": result_images[0]}
+                    if len(result_images) > 1:
+                        bundle_items["image_2"] = result_images[1]
+                    bundle_items["prompt"] = TextMedia(text=prompt)
+
+                    template_kwargs = {
+                        "prompt": prompt,
+                        "style": prompt,
+                    }
+
+                    output = agent.execute(
+                        MediaBundle(items=bundle_items),
+                        **template_kwargs,
+                    )
+
+                    for _key, media in output.items.items():
+                        if isinstance(media, ImageMedia):
+                            result_images = [media]
+                finally:
+                    agent.unload()
+
+            job_manager.update_progress(job_id, 0.95, "Saving results...")
+            var_results_dir = results_dir / product.id / variation.id
+            var_results_dir.mkdir(parents=True, exist_ok=True)
+
+            # Find next index by checking existing results
+            existing_count = len(variation.results)
+            next_idx = existing_count
+            fname = f"output_{next_idx}.png"
+            result_images[0].save(var_results_dir / fname)
+            variation.results.append(ResultFile(filename=fname))
+
+            variation.status = JobStatus.completed
+            store.save_product(product)
+
+            job_manager.complete(job_id)
+
+        except Exception as e:
+            variation.status = JobStatus.completed
+            store.save_product(product)
+            job_manager.fail(job_id, str(e))
+
+    @app.post(
+        "/api/products/{product_id}/variations/{variation_id}/add-image",
+        status_code=202,
+    )
+    def add_image_to_variation(
+        product_id: str,
+        variation_id: str,
+        req: RegenerateVariationRequest,
+    ) -> dict:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(
+                status_code=404, detail="Variation not found"
+            )
+
+        variation.status = JobStatus.running
+        store.save_product(product)
+
+        job_id = job_manager.create(product_id, variation.id)
+
+        thread = threading.Thread(
+            target=_run_add_image,
+            args=(product, variation, job_id, req.change_request),
+            daemon=True,
+        )
+        thread.start()
+
+        return {"job_id": job_id}
+
+    @app.post(
+        "/api/products/{product_id}/variations/{variation_id}/generate-360",
+        status_code=202,
+    )
+    def generate_360(
+        product_id: str,
+        variation_id: str,
+    ) -> dict:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(
+                status_code=404, detail="Variation not found"
+            )
+
+        job_id = job_manager.create(product_id, variation.id)
+
+        def _run_generate_360(
+            prod: Product,
+            var: Variation,
+            jid: str,
+        ) -> None:
+            import time
+
+            try:
+                steps = 10
+                for i in range(steps):
+                    time.sleep(0.5)
+                    job_manager.update(
+                        jid,
+                        progress=(i + 1) / steps,
+                        message=f"Generating view {i + 1}/{steps}...",
+                    )
+                # Placeholder: no real frames generated yet
+                job_manager.complete(jid)
+            except Exception as e:
+                job_manager.fail(jid, str(e))
+
+        thread = threading.Thread(
+            target=_run_generate_360,
+            args=(product, variation, job_id),
+            daemon=True,
+        )
+        thread.start()
+
+        return {"job_id": job_id}
+
     @app.delete(
         "/api/products/{product_id}/variations/{variation_id}",
         status_code=204,
@@ -1348,6 +1566,44 @@ def create_app(
             )
         store.save_product(product)
 
+    @app.put(
+        "/api/products/{product_id}/variations/{variation_id}/set-cover",
+        status_code=200,
+    )
+    def set_variation_cover(
+        product_id: str,
+        variation_id: str,
+        req: dict,
+    ) -> dict:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(status_code=404, detail="Variation not found")
+
+        filename = req.get("filename")
+        if not filename:
+            raise HTTPException(status_code=400, detail="filename required")
+
+        idx = next(
+            (i for i, r in enumerate(variation.results) if r.filename == filename),
+            None,
+        )
+        if idx is None:
+            raise HTTPException(status_code=404, detail="Result not found")
+
+        # Move the chosen result to the front
+        chosen = variation.results.pop(idx)
+        variation.results.insert(0, chosen)
+        store.save_product(product)
+        return {"ok": True}
+
     # ── Collections ──────────────────────────────────────────────
 
     @app.get("/api/collections")
@@ -1365,6 +1621,18 @@ def create_app(
         collection = store.get_collection(collection_id)
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")
+        return collection
+
+    @app.put("/api/collections/{collection_id}")
+    def update_collection(
+        collection_id: str, req: UpdateCollectionRequest
+    ) -> Collection:
+        collection = store.get_collection(collection_id)
+        if not collection:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        for field, value in req.model_dump(exclude_none=True).items():
+            setattr(collection, field, value)
+        store.save_collection(collection)
         return collection
 
     @app.delete("/api/collections/{collection_id}", status_code=204)
@@ -1402,6 +1670,23 @@ def create_app(
                 status_code=404, detail="Product not in collection"
             )
         collection.product_ids.remove(product_id)
+        store.save_collection(collection)
+        return collection
+
+    @app.put("/api/collections/{collection_id}/reorder", status_code=200)
+    def reorder_collection_products(
+        collection_id: str, body: dict
+    ) -> Collection:
+        collection = store.get_collection(collection_id)
+        if not collection:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        new_order = body.get("product_ids", [])
+        if set(new_order) != set(collection.product_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="product_ids must contain the same products",
+            )
+        collection.product_ids = new_order
         store.save_collection(collection)
         return collection
 

@@ -46,6 +46,13 @@ class Generation(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class GeneratedResult(BaseModel):
+    filename: str
+    pipeline: str = ""
+    label: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class Variation(BaseModel):
     id: str = Field(default_factory=_new_id)
     material: str = ""
@@ -54,6 +61,8 @@ class Variation(BaseModel):
     pipeline: str = ""
     num_outputs: int = 1
     results: list[ResultFile] = []
+    generated_results: list[GeneratedResult] = []
+    spin_frames: list[ResultFile] = []
     status: JobStatus = JobStatus.pending
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -89,11 +98,23 @@ class Collection(BaseModel):
     id: str = Field(default_factory=_new_id)
     name: str
     product_ids: list[str] = []
+    price_min: float | None = None
+    price_max: float | None = None
+    target_tags: list[str] = []
+    target_description: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
 
 
 class CreateCollectionRequest(BaseModel):
     name: str
+
+
+class UpdateCollectionRequest(BaseModel):
+    name: str | None = None
+    price_min: float | None = None
+    price_max: float | None = None
+    target_tags: list[str] | None = None
+    target_description: str | None = None
 
 
 class AddProductToCollectionRequest(BaseModel):
