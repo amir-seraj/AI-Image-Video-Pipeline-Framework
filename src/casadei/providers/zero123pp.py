@@ -80,7 +80,7 @@ class Zero123PlusPlus(ImageToMultiViewModel):
                 "diffusers is required. Install: pip install diffusers transformers"
             )
 
-        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
         pipe = DiffusionPipeline.from_pretrained(
             self.MODEL_ID,

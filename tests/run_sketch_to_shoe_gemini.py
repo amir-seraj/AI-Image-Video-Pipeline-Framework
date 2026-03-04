@@ -13,6 +13,9 @@ Usage:
         --material suede --color beige --camera-angle "3/4 view" \\
         --spec style=elegant note="chunky platform"
     python tests/run_sketch_to_shoe_gemini.py --max-iter 3 --tolerance moderate
+    python tests/run_sketch_to_shoe_gemini.py --foot pair   # both shoes (default)
+    python tests/run_sketch_to_shoe_gemini.py --foot left   # left shoe only
+    python tests/run_sketch_to_shoe_gemini.py --foot right  # right shoe only
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ PROMPT_TEMPLATE = (
     "The first image is the original shoe design sketch — the reference for the "
     "shoe's shape, structure, and design elements. "
     "The second image shows the current version of the shoe rendering. "
-    "Generate a professional photorealistic product photograph of this shoe design, "
+    "Generate a professional photorealistic telephoto product photograph of this shoe design, "
     "faithfully following the sketch.\n\n"
     "Design specifications:\n"
     "- Material: $material\n"
@@ -64,9 +67,29 @@ PROMPT_TEMPLATE = (
     "- Camera angle: $camera_angle\n"
     "$extra_specs\n\n"
     "The result must be a studio-quality photograph: clean white background, "
-    "professional product lighting, sharp focus, no shadows on background, "
-    "shoe centered and fully visible. $feedback"
+    "professional product lighting, sharp focus, no shadows on background. "
+    "$foot_framing $feedback"
 )
+
+
+def _foot_framing(foot: str) -> str:
+    if foot == "pair":
+        return (
+            "Show a matching pair of shoes — both left and right — "
+            "centered side by side."
+        )
+    elif foot == "left":
+        return "Show the left shoe only, centered and fully visible."
+    else:
+        return "Show the right shoe only, centered and fully visible."
+
+
+def _default_camera_angle(foot: str) -> str:
+    if foot == "left":
+        return "3/4 view from the left"
+    elif foot == "right":
+        return "3/4 view from the right"
+    return "3/4 view"
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +164,11 @@ def build_pipeline(
     vlm_session: VLMSession | None = None,
     sketch_features: list[str] | None = None,
     tolerance: str = "strict",
+    foot: str = "pair",
 ) -> Pipeline:
     """Build the iterative sketch-to-shoe pipeline using Gemini models."""
     if vlm_session is None:
-        vlm_session = VLMSession("gemini_flash")
+        vlm_session = VLMSession("gemini_flash_lite")
 
     extra_specs_text = _build_extra_specs_text(spec.get("extra", {}))
 
@@ -168,8 +192,9 @@ def build_pipeline(
         template_kwargs={
             "material": spec.get("material", "leather"),
             "color": spec.get("color", "black"),
-            "camera_angle": spec.get("camera_angle", "3/4 view"),
+            "camera_angle": spec.get("camera_angle", _default_camera_angle(foot)),
             "extra_specs": extra_specs_text,
+            "foot_framing": _foot_framing(foot),
             "feedback": "",
         },
     )
@@ -229,6 +254,7 @@ def save_results(
     total_elapsed: float,
     sketch_features: list[str] | None = None,
     tolerance: str = "strict",
+    foot: str = "pair",
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     sketch_grid.save(run_dir / "input_sketch_grid.png")
@@ -238,8 +264,9 @@ def save_results(
         "total_elapsed_s": total_elapsed,
         "models": {
             "image_edit": "gemini_flash_image_edit",
-            "vlm_judge": "gemini_flash",
+            "vlm_judge": "gemini_flash_lite",
         },
+        "foot": foot,
         "spec": spec,
         "sketch_features": sketch_features or [],
         "tolerance": tolerance,
@@ -295,7 +322,8 @@ def save_results(
         f"Date: {datetime.now().isoformat()}",
         f"Total time: {total_elapsed:.1f}s",
         f"Image edit model: gemini_flash_image_edit",
-        f"VLM judge model:  gemini_flash",
+        f"VLM judge model:  gemini_flash_lite",
+        f"Foot output:  {foot}",
         f"Material: {spec.get('material')}  Color: {spec.get('color')}  Angle: {spec.get('camera_angle')}",
         f"Sketch features: {sketch_features or []}",
         f"Tolerance: {tolerance}",
@@ -339,9 +367,12 @@ def main():
         help="Shoe material (e.g. leather, suede, canvas)")
     parser.add_argument("--color", type=str, default="black",
         help="Shoe color (e.g. black, white, red)")
-    parser.add_argument("--camera-angle", type=str, default="3/4 view",
+    parser.add_argument("--foot", type=str, default="pair",
+        choices=["pair", "left", "right"],
+        help="Output: 'pair' for both shoes (default), 'left' or 'right' for a single shoe")
+    parser.add_argument("--camera-angle", type=str, default=None,
         dest="camera_angle",
-        help="Camera angle: '3/4 view', 'side view', 'front view', 'top view', or custom")
+        help="Camera angle (default: auto based on --foot: pair→'3/4 view', left→'3/4 view from the left', right→'3/4 view from the right')")
     parser.add_argument("--spec", type=str, nargs="*", default=[],
         metavar="KEY=VALUE",
         help="Open-ended extras, e.g. style=elegant note='chunky sole'")
@@ -358,11 +389,14 @@ def main():
         print("Error: GEMINI_API_KEY not set. Add it to your .env file.")
         return
 
+    camera_angle = args.camera_angle or _default_camera_angle(args.foot)
+
     print("=== Sketch-to-Shoe Agentic Loop — Gemini ===")
     print(f"Sketches:      {args.sketches}")
+    print(f"Foot output:   {args.foot}")
     print(f"Material:      {args.material}")
     print(f"Color:         {args.color}")
-    print(f"Camera angle:  {args.camera_angle}")
+    print(f"Camera angle:  {camera_angle}")
     extra_spec = _parse_spec_args(args.spec)
     if extra_spec:
         print(f"Extra spec:    {extra_spec}")
@@ -370,7 +404,7 @@ def main():
     print(f"Tolerance:     {args.tolerance}")
     print(f"Scale:         {args.scale}x")
     print(f"Image edit:    gemini_flash_image_edit (Nano Banana 2)")
-    print(f"VLM judge:     gemini_flash (Gemini 3 Flash)")
+    print(f"VLM judge:     gemini_flash_lite (Gemini 3.1 Flash Lite)")
     print()
 
     raw_sketches = []
@@ -390,11 +424,11 @@ def main():
     spec = {
         "material": args.material,
         "color": args.color,
-        "camera_angle": args.camera_angle,
+        "camera_angle": camera_angle,
         "extra": extra_spec,
     }
 
-    vlm_session = VLMSession("gemini_flash")
+    vlm_session = VLMSession("gemini_flash_lite")
     sketch_media = ImageMedia(image=sketch_grid)
 
     print("Extracting sketch design features...")
@@ -409,6 +443,7 @@ def main():
         vlm_session=vlm_session,
         sketch_features=sketch_features,
         tolerance=args.tolerance,
+        foot=args.foot,
     )
     logged = LoggedPipeline(pipeline)
 
@@ -444,6 +479,7 @@ def main():
         total_elapsed=total_elapsed,
         sketch_features=sketch_features,
         tolerance=args.tolerance,
+        foot=args.foot,
     )
 
     print(f"\nDone. Results saved to: {run_dir}")

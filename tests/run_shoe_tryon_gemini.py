@@ -58,7 +58,7 @@ def build_pipeline(
 ) -> Pipeline:
     """Build the iterative shoe replacement pipeline using Gemini models."""
     if vlm_session is None:
-        vlm_session = VLMSession("gemini_flash")
+        vlm_session = VLMSession("gemini_flash_lite")
 
     gemini_edit_agent = Agent(AgentConfig(
         name="gemini_shoe_replace",
@@ -127,7 +127,7 @@ def save_results(
         "total_elapsed_s": total_elapsed,
         "models": {
             "image_edit": "gemini_flash_image_edit",
-            "vlm_judge": "gemini_flash",
+            "vlm_judge": "gemini_flash_lite",
         },
         "features": features or [],
         "tolerance": tolerance,
@@ -182,7 +182,7 @@ def save_results(
         f"Date: {datetime.now().isoformat()}",
         f"Total time: {total_elapsed:.1f}s",
         f"Image edit model: gemini_flash_image_edit",
-        f"VLM judge model:  gemini_flash",
+        f"VLM judge model:  gemini_flash_lite",
         f"Features: {features or []}",
         f"Tolerance: {tolerance}",
         f"Iterations: {len(loop_result.iterations)}",
@@ -253,7 +253,7 @@ def main():
     print(f"Tolerance:     {args.tolerance}")
     print(f"Scale:         {args.scale}x")
     print(f"Image edit:    gemini_flash_image_edit (Nano Banana 2)")
-    print(f"VLM judge:     gemini_flash (Gemini 3 Flash)")
+    print(f"VLM judge:     gemini_flash_lite (Gemini 3.1 Flash Lite)")
     print()
 
     source = PILImage.open(args.source).convert("RGB")
@@ -270,7 +270,7 @@ def main():
         )
         print(f"Resized — source: {source.size}, shoes: {shoes.size}")
 
-    vlm_session = VLMSession("gemini_flash")
+    vlm_session = VLMSession("gemini_flash_lite")
 
     shoe_media = ImageMedia(image=shoes)
     print("Extracting shoe features...")
