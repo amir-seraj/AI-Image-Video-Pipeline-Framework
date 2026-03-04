@@ -1498,6 +1498,7 @@ def create_app(
     def generate_360(
         product_id: str,
         variation_id: str,
+        provider: str = "zero123pp",
     ) -> dict:
         product = store.get_product(product_id)
         if not product:
@@ -1513,37 +1514,83 @@ def create_app(
                 status_code=404, detail="Variation not found"
             )
 
+        if not variation.results:
+            raise HTTPException(
+                status_code=400,
+                detail="Variation has no rendered images to generate 360 from",
+            )
+
         job_id = job_manager.create(product_id, variation.id)
-
-        def _run_generate_360(
-            prod: Product,
-            var: Variation,
-            jid: str,
-        ) -> None:
-            import time
-
-            try:
-                steps = 10
-                for i in range(steps):
-                    time.sleep(0.5)
-                    job_manager.update(
-                        jid,
-                        progress=(i + 1) / steps,
-                        message=f"Generating view {i + 1}/{steps}...",
-                    )
-                # Placeholder: no real frames generated yet
-                job_manager.complete(jid)
-            except Exception as e:
-                job_manager.fail(jid, str(e))
 
         thread = threading.Thread(
             target=_run_generate_360,
-            args=(product, variation, job_id),
+            args=(product, variation, job_id, provider),
             daemon=True,
         )
         thread.start()
 
         return {"job_id": job_id}
+
+    def _run_generate_360(
+        prod: Product,
+        var: Variation,
+        jid: str,
+        provider_name: str,
+    ) -> None:
+        """Background thread: generates 360° spin frames for a variation."""
+        try:
+            from casadei import ImageMedia
+            from casadei.media import MediaBundle
+            from casadei.models.registry import default_registry
+
+            job_manager.update_progress(jid, 0.05, "Loading source image...")
+
+            # Load the first result image as source
+            var_results_dir = results_dir / prod.id / var.id
+            source_path = var_results_dir / var.results[0].filename
+            source = ImageMedia.load(source_path)
+
+            job_manager.update_progress(jid, 0.1, f"Loading {provider_name} model...")
+
+            model_cls = default_registry.get(provider_name)
+            model = model_cls()
+            model.load_model()
+
+            try:
+                job_manager.update_progress(jid, 0.2, "Generating views...")
+                result = model.run(
+                    MediaBundle(items={"image": source}),
+                    num_views=6,
+                )
+
+                job_manager.update_progress(jid, 0.8, "Saving frames...")
+
+                spin_dir = var_results_dir
+                spin_dir.mkdir(parents=True, exist_ok=True)
+
+                spin_files = []
+                for i, (key, media) in enumerate(sorted(result.items.items())):
+                    if isinstance(media, ImageMedia):
+                        fname = f"spin_frame_{i}.png"
+                        media.save(spin_dir / fname)
+                        spin_files.append(ResultFile(filename=fname))
+
+                var.spin_frames = spin_files
+                var.status = JobStatus.completed
+                store.save_product(prod)
+
+                job_manager.update_progress(jid, 1.0, "Done!")
+                job_manager.complete(jid)
+
+            finally:
+                model.unload_model()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            var.status = JobStatus.failed
+            store.save_product(prod)
+            job_manager.fail(jid, str(e))
 
     @app.delete(
         "/api/products/{product_id}/variations/{variation_id}",
