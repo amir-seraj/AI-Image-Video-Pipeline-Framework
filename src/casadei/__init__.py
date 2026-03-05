@@ -23,6 +23,7 @@ from casadei.providers.wan_i2v import WanImageToVideo
 from casadei.providers.wan_i2v_fp8 import WanImageToVideoFP8
 from casadei.providers.wan_video_edit import WanVideoEdit
 from casadei.providers.wan_video_edit_fp8 import WanVideoEditFP8
+from casadei.providers.veo_video_generate import VeoVideoGenerate
 from casadei.agent import Agent, AgentConfig, load_agent, save_agent
 from casadei.pipeline import AgentStep, CodeStep, PipelineStep, Pipeline
 from casadei.loop import LoopStep, LoopIteration, LoopResult
@@ -46,6 +47,7 @@ __all__ = [
     "Qwen3VL30B",
     "WanImageToVideo", "WanImageToVideoFP8",
     "WanVideoEdit", "WanVideoEditFP8",
+    "VeoVideoGenerate",
     "Agent", "AgentConfig", "load_agent", "save_agent",
     "AgentStep", "CodeStep", "PipelineStep", "Pipeline",
     "LoopStep", "LoopIteration", "LoopResult",

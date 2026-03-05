@@ -10,7 +10,9 @@ from casadei.providers.gemini_flash import GeminiFlash
 from casadei.providers.gemini_flash_lite import GeminiFlashLite
 from casadei.providers.gemini_flash_image_edit import GeminiFlashImageEdit
 from casadei.providers.zero123pp import Zero123PlusPlus
+from casadei.providers.sv3d import SV3D
 from casadei.providers.gemini_flash_multiview import GeminiFlashMultiView
+from casadei.providers.veo_video_generate import VeoVideoGenerate
 
 __all__ = [
     "QwenImageEdit",
@@ -21,5 +23,7 @@ __all__ = [
     "GeminiFlashLite",
     "GeminiFlashImageEdit",
     "Zero123PlusPlus",
+    "SV3D",
     "GeminiFlashMultiView",
+    "VeoVideoGenerate",
 ]

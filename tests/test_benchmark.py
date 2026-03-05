@@ -28,9 +28,10 @@ NUM_STEPS = 30
 
 # (registry_name, label, steps_kwarg, enabled_by_default)
 MODELS = [
-    ("longcat_image_edit",         "longcat",             "num_inference_steps",  True),
+    ("longcat_image_edit",         "longcat",             "num_inference_steps",  False),
     ("hunyuan_image3_nf4",         "hunyuan_nf4",         "diff_infer_steps",    False),
     ("hunyuan_image3_distil_int8", "hunyuan_distil_int8", "diff_infer_steps",    False),
+    ("hunyuan_image3_qint4",       "hunyuan_qint4",       "diff_infer_steps",    True),
     ("firered_image_edit",         "firered",             "num_inference_steps",  True),
     ("qwen_image_edit",            "full",                "num_inference_steps",  True),
     ("qwen_image_edit_fp8",        "fp8",                 "num_inference_steps",  False),

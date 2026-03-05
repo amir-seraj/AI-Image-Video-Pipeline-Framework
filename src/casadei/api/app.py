@@ -42,6 +42,7 @@ from .models import (
     RunResponse,
     Sketch,
     UpdateCollectionRequest,
+    UpdateVariationMetaRequest,
     Variation,
 )
 from .store import JsonStore
@@ -1539,51 +1540,12 @@ def create_app(
     ) -> None:
         """Background thread: generates 360° spin frames for a variation."""
         try:
-            from casadei import ImageMedia
-            from casadei.media import MediaBundle
-            from casadei.models.registry import default_registry
-
-            job_manager.update_progress(jid, 0.05, "Loading source image...")
-
-            # Load the first result image as source
             var_results_dir = results_dir / prod.id / var.id
-            source_path = var_results_dir / var.results[0].filename
-            source = ImageMedia.load(source_path)
 
-            job_manager.update_progress(jid, 0.1, f"Loading {provider_name} model...")
-
-            model_cls = default_registry.get(provider_name)
-            model = model_cls()
-            model.load_model()
-
-            try:
-                job_manager.update_progress(jid, 0.2, "Generating views...")
-                result = model.run(
-                    MediaBundle(items={"image": source}),
-                    num_views=6,
-                )
-
-                job_manager.update_progress(jid, 0.8, "Saving frames...")
-
-                spin_dir = var_results_dir
-                spin_dir.mkdir(parents=True, exist_ok=True)
-
-                spin_files = []
-                for i, (key, media) in enumerate(sorted(result.items.items())):
-                    if isinstance(media, ImageMedia):
-                        fname = f"spin_frame_{i}.png"
-                        media.save(spin_dir / fname)
-                        spin_files.append(ResultFile(filename=fname))
-
-                var.spin_frames = spin_files
-                var.status = JobStatus.completed
-                store.save_product(prod)
-
-                job_manager.update_progress(jid, 1.0, "Done!")
-                job_manager.complete(jid)
-
-            finally:
-                model.unload_model()
+            if provider_name == "existing":
+                _run_generate_360_from_existing(prod, var, jid, var_results_dir)
+            else:
+                _run_generate_360_ai(prod, var, jid, provider_name, var_results_dir)
 
         except Exception as e:
             import traceback
@@ -1591,6 +1553,109 @@ def create_app(
             var.status = JobStatus.failed
             store.save_product(prod)
             job_manager.fail(jid, str(e))
+
+    def _run_generate_360_from_existing(
+        prod: Product,
+        var: Variation,
+        jid: str,
+        var_results_dir: Path,
+    ) -> None:
+        """Use the variation's existing result images as spin frames."""
+        import shutil
+
+        job_manager.update_progress(jid, 0.2, "Copying existing images as spin frames...")
+
+        spin_files = []
+        for i, rf in enumerate(var.results):
+            src = var_results_dir / rf.filename
+            if not src.exists():
+                continue
+            fname = f"spin_frame_{i}.png"
+            dst = var_results_dir / fname
+            shutil.copy2(src, dst)
+            spin_files.append(ResultFile(filename=fname))
+
+        var.spin_frames = spin_files
+        store.save_product(prod)
+
+        job_manager.update_progress(jid, 1.0, f"Done — {len(spin_files)} frames")
+        job_manager.complete(jid)
+
+    def _run_generate_360_ai(
+        prod: Product,
+        var: Variation,
+        jid: str,
+        provider_name: str,
+        var_results_dir: Path,
+    ) -> None:
+        """Generate spin frames using an AI multi-view model."""
+        from casadei import ImageMedia
+        from casadei.media import MediaBundle
+        from casadei.models.registry import default_registry
+
+        job_manager.update_progress(jid, 0.05, "Loading source image...")
+
+        source_path = var_results_dir / var.results[0].filename
+        source = ImageMedia.load(source_path)
+
+        job_manager.update_progress(jid, 0.1, f"Loading {provider_name} model...")
+
+        model_cls = default_registry.get(provider_name)
+        model = model_cls()
+        model.load_model()
+
+        try:
+            job_manager.update_progress(jid, 0.2, "Generating views...")
+            result = model.run(
+                MediaBundle(items={"image": source}),
+                num_views=6,
+            )
+
+            job_manager.update_progress(jid, 0.8, "Saving frames...")
+
+            var_results_dir.mkdir(parents=True, exist_ok=True)
+
+            spin_files = []
+            for i, (key, media) in enumerate(sorted(result.items.items())):
+                if isinstance(media, ImageMedia):
+                    fname = f"spin_frame_{i}.png"
+                    media.save(var_results_dir / fname)
+                    spin_files.append(ResultFile(filename=fname))
+
+            var.spin_frames = spin_files
+            store.save_product(prod)
+
+            job_manager.update_progress(jid, 1.0, "Done!")
+            job_manager.complete(jid)
+
+        finally:
+            model.unload_model()
+
+    @app.patch(
+        "/api/products/{product_id}/variations/{variation_id}/meta",
+        status_code=200,
+    )
+    def update_variation_meta(
+        product_id: str,
+        variation_id: str,
+        req: UpdateVariationMetaRequest,
+    ) -> dict:
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        for v in product.variations:
+            if v.id == variation_id:
+                if req.tags is not None:
+                    v.tags = req.tags
+                if req.price is not None:
+                    v.price = req.price
+                elif req.model_fields_set and "price" in req.model_fields_set:
+                    v.price = None
+                store.save_product(product)
+                return {"tags": v.tags, "price": v.price}
+
+        raise HTTPException(status_code=404, detail="Variation not found")
 
     @app.delete(
         "/api/products/{product_id}/variations/{variation_id}",

@@ -57,19 +57,318 @@ OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_gemini"
 
 PROMPT_TEMPLATE = (
     "The first image is the original shoe design sketch — the reference for the "
-    "shoe's shape, structure, and design elements. "
-    "The second image shows the current version of the shoe rendering. "
-    "Generate a professional photorealistic telephoto product photograph of this shoe design, "
-    "faithfully following the sketch.\n\n"
+    "shoe's shape, structure, and design elements. The second image shows the "
+    "current version of the shoe rendering. Generate a professional photorealistic "
+    "telephoto product photograph of this shoe design, faithfully following the "
+    "sketch.\n\n"
     "Design specifications:\n"
     "- Material: $material\n"
     "- Color: $color\n"
-    "- Camera angle: $camera_angle\n"
+    "- Camera angle: $camera_desc\n"
+    "- Shoe alignment and staging: $staging_desc\n"
     "$extra_specs\n\n"
     "The result must be a studio-quality photograph: clean white background, "
     "professional product lighting, sharp focus, no shadows on background. "
     "$foot_framing $feedback"
 )
+
+# ---------------------------------------------------------------------------
+# Camera angle presets — deterministic prompt fragments per angle
+# ---------------------------------------------------------------------------
+
+CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
+    "3/4": {
+        "pair": {
+            "camera_desc": (
+                "Low, ground-level angle, shooting almost parallel to the platform. "
+                "The camera is positioned slightly to the right, looking leftwards "
+                "at the shoes (3/4)."
+            ),
+            "staging_desc": (
+                "A pair of shoes perfectly aligned and parallel, touching side by side, "
+                "both pointing in the same direction at the same angle."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Low, ground-level angle, shooting almost parallel to the platform. "
+                "The camera is positioned slightly to the left, looking rightwards "
+                "at the left shoe (3/4 from the left)."
+            ),
+            "staging_desc": "The left shoe centered on the white surface.",
+        },
+        "right": {
+            "camera_desc": (
+                "Low, ground-level angle, shooting almost parallel to the platform. "
+                "The camera is positioned slightly to the right, looking leftwards "
+                "at the right shoe (3/4 from the right)."
+            ),
+            "staging_desc": "The right shoe centered on the white surface.",
+        },
+    },
+    "side": {
+        "pair": {
+            "camera_desc": (
+                "Straight side-on profile view, camera at shoe mid-height, "
+                "perpendicular to the shoes' length axis. The full silhouette "
+                "from toe to heel is visible for both shoes."
+            ),
+            "staging_desc": (
+                "A pair of shoes placed side by side on the white surface showing "
+                "their complete lateral profile."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Straight side-on profile view from the left (medial side), "
+                "camera at shoe mid-height, perpendicular to the left shoe's "
+                "length axis."
+            ),
+            "staging_desc": "The left shoe centered, medial side facing the camera.",
+        },
+        "right": {
+            "camera_desc": (
+                "Straight side-on profile view from the right (lateral side), "
+                "camera at shoe mid-height, perpendicular to the right shoe's "
+                "length axis."
+            ),
+            "staging_desc": "The right shoe centered, lateral side facing the camera.",
+        },
+    },
+    "front": {
+        "pair": {
+            "camera_desc": (
+                "Head-on front view at shoe mid-height, camera looking straight "
+                "at the toe boxes. Both shoes are visible, slightly angled outward."
+            ),
+            "staging_desc": (
+                "A pair of shoes placed next to each other, toe boxes facing "
+                "the camera."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Head-on front view at shoe mid-height, camera looking straight "
+                "at the toe box of the left shoe."
+            ),
+            "staging_desc": "The left shoe centered, toe box facing the camera.",
+        },
+        "right": {
+            "camera_desc": (
+                "Head-on front view at shoe mid-height, camera looking straight "
+                "at the toe box of the right shoe."
+            ),
+            "staging_desc": "The right shoe centered, toe box facing the camera.",
+        },
+    },
+    "back": {
+        "pair": {
+            "camera_desc": (
+                "Rear view at shoe mid-height, camera looking straight at the heels. "
+                "Both shoes are visible, showing the heel counter and back stitching."
+            ),
+            "staging_desc": (
+                "A pair of shoes placed next to each other, heels facing the camera."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Rear view at shoe mid-height, camera looking straight at the heel "
+                "of the left shoe, showing the heel counter and back stitching."
+            ),
+            "staging_desc": "The left shoe centered, heel facing the camera.",
+        },
+        "right": {
+            "camera_desc": (
+                "Rear view at shoe mid-height, camera looking straight at the heel "
+                "of the right shoe, showing the heel counter and back stitching."
+            ),
+            "staging_desc": "The right shoe centered, heel facing the camera.",
+        },
+    },
+    "top": {
+        "pair": {
+            "camera_desc": (
+                "Directly overhead bird's-eye view, camera pointing straight down. "
+                "The full footbed outline from toe to heel is visible for both shoes."
+            ),
+            "staging_desc": (
+                "A pair of shoes placed next to each other on the white surface, "
+                "viewed from above."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Directly overhead bird's-eye view, camera pointing straight down "
+                "at the left shoe. The full footbed outline from toe to heel is visible."
+            ),
+            "staging_desc": "The left shoe centered on the white surface, viewed from above.",
+        },
+        "right": {
+            "camera_desc": (
+                "Directly overhead bird's-eye view, camera pointing straight down "
+                "at the right shoe. The full footbed outline from toe to heel is visible."
+            ),
+            "staging_desc": "The right shoe centered on the white surface, viewed from above.",
+        },
+    },
+    "hero-front-right": {
+        "pair": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the front-right of the shoes, angled upward. "
+                "Slight Dutch tilt for editorial drama. The toe box and right side "
+                "of the shoes are prominent."
+            ),
+            "staging_desc": (
+                "A pair of shoes on the white surface, filling the frame with presence."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the front-right of the left shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The toe box and outer side "
+                "of the left shoe are prominent."
+            ),
+            "staging_desc": "The left shoe filling the frame with presence.",
+        },
+        "right": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the front-right of the right shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The toe box and outer side "
+                "of the right shoe are prominent."
+            ),
+            "staging_desc": "The right shoe filling the frame with presence.",
+        },
+    },
+    "hero-front-left": {
+        "pair": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the front-left of the shoes, angled upward. "
+                "Slight Dutch tilt for editorial drama. The toe box and left side "
+                "of the shoes are prominent."
+            ),
+            "staging_desc": (
+                "A pair of shoes on the white surface, filling the frame with presence."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the front-left of the left shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The toe box and inner side "
+                "of the left shoe are prominent."
+            ),
+            "staging_desc": "The left shoe filling the frame with presence.",
+        },
+        "right": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the front-left of the right shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The toe box and inner side "
+                "of the right shoe are prominent."
+            ),
+            "staging_desc": "The right shoe filling the frame with presence.",
+        },
+    },
+    "hero-back-right": {
+        "pair": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the back-right of the shoes, angled upward. "
+                "Slight Dutch tilt for editorial drama. The heel counter and right side "
+                "of the shoes are prominent."
+            ),
+            "staging_desc": (
+                "A pair of shoes on the white surface, filling the frame with presence."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the back-right of the left shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The heel and outer side "
+                "of the left shoe are prominent."
+            ),
+            "staging_desc": "The left shoe filling the frame with presence.",
+        },
+        "right": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the back-right of the right shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The heel and outer side "
+                "of the right shoe are prominent."
+            ),
+            "staging_desc": "The right shoe filling the frame with presence.",
+        },
+    },
+    "hero-back-left": {
+        "pair": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the back-left of the shoes, angled upward. "
+                "Slight Dutch tilt for editorial drama. The heel counter and left side "
+                "of the shoes are prominent."
+            ),
+            "staging_desc": (
+                "A pair of shoes on the white surface, filling the frame with presence."
+            ),
+        },
+        "left": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the back-left of the left shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The heel and inner side "
+                "of the left shoe are prominent."
+            ),
+            "staging_desc": "The left shoe filling the frame with presence.",
+        },
+        "right": {
+            "camera_desc": (
+                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
+                "positioned at the back-left of the right shoe, angled upward. "
+                "Slight Dutch tilt for editorial drama. The heel and inner side "
+                "of the right shoe are prominent."
+            ),
+            "staging_desc": "The right shoe filling the frame with presence.",
+        },
+    },
+}
+
+# Aliases for convenience
+CAMERA_PRESETS["3/4 view"] = CAMERA_PRESETS["3/4"]
+CAMERA_PRESETS["side view"] = CAMERA_PRESETS["side"]
+CAMERA_PRESETS["front view"] = CAMERA_PRESETS["front"]
+CAMERA_PRESETS["back view"] = CAMERA_PRESETS["back"]
+CAMERA_PRESETS["top view"] = CAMERA_PRESETS["top"]
+CAMERA_PRESETS["hero"] = CAMERA_PRESETS["hero-front-right"]
+
+CANONICAL_ANGLES = [
+    "3/4", "side", "front", "back", "top",
+    "hero-front-right", "hero-front-left", "hero-back-right", "hero-back-left",
+]
+
+# Angles that naturally show a pair vs a single shoe
+PAIR_ANGLES = {"3/4", "front"}
+SINGLE_ANGLES = {
+    "side", "back", "top",
+    "hero-front-right", "hero-front-left", "hero-back-right", "hero-back-left",
+}
+
+
+def _get_camera_preset(angle: str, foot: str = "pair") -> dict[str, str]:
+    """Look up camera preset by angle and foot. Falls back to raw angle string."""
+    key = angle.lower().strip()
+    if key in CAMERA_PRESETS:
+        return CAMERA_PRESETS[key][foot]
+    # Fallback: use the raw angle as-is (user provided a custom description)
+    return {
+        "camera_desc": angle,
+        "staging_desc": "The shoe(s) placed on the white surface.",
+    }
 
 
 def _foot_framing(foot: str) -> str:
@@ -85,11 +384,7 @@ def _foot_framing(foot: str) -> str:
 
 
 def _default_camera_angle(foot: str) -> str:
-    if foot == "left":
-        return "3/4 view from the left"
-    elif foot == "right":
-        return "3/4 view from the right"
-    return "3/4 view"
+    return "3/4"
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +485,9 @@ def build_pipeline(
         },
         output_map={"image": "image"},
         template_kwargs={
-            "material": spec.get("material", "leather"),
+            "material": spec.get("material", "patent leather"),
             "color": spec.get("color", "black"),
-            "camera_angle": spec.get("camera_angle", _default_camera_angle(foot)),
+            **_get_camera_preset(spec.get("camera_angle", _default_camera_angle(foot)), foot),
             "extra_specs": extra_specs_text,
             "foot_framing": _foot_framing(foot),
             "feedback": "",
@@ -200,7 +495,7 @@ def build_pipeline(
     )
 
     full_spec = {
-        "material": spec.get("material", "leather"),
+        "material": spec.get("material", "patent leather"),
         "color": spec.get("color", "black"),
         "camera_angle": spec.get("camera_angle", "3/4 view"),
         **spec.get("extra", {}),
@@ -363,7 +658,7 @@ def main():
     )
     parser.add_argument("--sketches", type=str, nargs="+", required=True,
         help="Path(s) to sketch image(s)")
-    parser.add_argument("--material", type=str, default="leather",
+    parser.add_argument("--material", type=str, default="patent leather",
         help="Shoe material (e.g. leather, suede, canvas)")
     parser.add_argument("--color", type=str, default="black",
         help="Shoe color (e.g. black, white, red)")
@@ -372,7 +667,9 @@ def main():
         help="Output: 'pair' for both shoes (default), 'left' or 'right' for a single shoe")
     parser.add_argument("--camera-angle", type=str, default=None,
         dest="camera_angle",
-        help="Camera angle (default: auto based on --foot: pair→'3/4 view', left→'3/4 view from the left', right→'3/4 view from the right')")
+        help="Camera angle preset: 3/4, side, front, back, top, hero "
+             "(or any custom string). Default: 3/4. "
+             "Foot variation (pair/left/right) is selected via --foot.")
     parser.add_argument("--spec", type=str, nargs="*", default=[],
         metavar="KEY=VALUE",
         help="Open-ended extras, e.g. style=elegant note='chunky sole'")

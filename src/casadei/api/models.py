@@ -63,8 +63,15 @@ class Variation(BaseModel):
     results: list[ResultFile] = []
     generated_results: list[GeneratedResult] = []
     spin_frames: list[ResultFile] = []
+    tags: list[str] = []
+    price: float | None = None
     status: JobStatus = JobStatus.pending
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class UpdateVariationMetaRequest(BaseModel):
+    tags: list[str] | None = None
+    price: float | None = Field(default=None)
 
 
 class Product(BaseModel):
