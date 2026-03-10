@@ -1954,32 +1954,6 @@ def create_app(
             "Professional e-commerce turntable spin, photorealistic."
         )
 
-        # Build reference images from additional selections (up to 3)
-        ref_images = []
-        for extra_img in source_imgs[1:4]:  # max 3 references
-            rbuf = io.BytesIO()
-            extra_img.save(rbuf, format="PNG")
-            ref_images.append(
-                types.VideoGenerationReferenceImage(
-                    image=types.Image(
-                        image_bytes=rbuf.getvalue(),
-                        mime_type="image/png",
-                    ),
-                    reference_type="ASSET",
-                )
-            )
-
-        veo_config = types.GenerateVideosConfig(
-            aspect_ratio="16:9",
-            resolution="4k",
-            last_frame=types.Image(
-                image_bytes=img_bytes,
-                mime_type="image/png",
-            ),
-        )
-        if ref_images:
-            veo_config.reference_images = ref_images
-
         operation = client.models.generate_videos(
             model="veo-3.1-fast-generate-preview",
             prompt=prompt,
@@ -1987,7 +1961,14 @@ def create_app(
                 image_bytes=img_bytes,
                 mime_type="image/png",
             ),
-            config=veo_config,
+            config=types.GenerateVideosConfig(
+                aspect_ratio="16:9",
+                resolution="4k",
+                last_frame=types.Image(
+                    image_bytes=img_bytes,
+                    mime_type="image/png",
+                ),
+            ),
         )
 
         # Poll until done

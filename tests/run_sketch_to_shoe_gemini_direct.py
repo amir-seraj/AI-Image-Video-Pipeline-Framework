@@ -42,7 +42,7 @@ from casadei import (
 )
 from casadei.loop import LoopStep, LoopResult
 from casadei.providers.gemini_pricing import format_usage_summary
-from judge import VLMSession, make_spec_judge, make_best_fn
+from judge import VLMSession, make_spec_judge, make_shoe_count_judge, make_best_fn
 
 IMAGE_DIR = Path(__file__).parent / "Image"
 OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_gemini_direct"
@@ -72,18 +72,13 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "3/4": {
         "pair": {
             "camera_desc": (
-                "Classic luxury product 3/4 angle: the camera is low (near ground level), "
-                "positioned to the front-left of the shoes, looking toward the front-right. "
-                "The toe boxes face away from the camera diagonally. "
-                "This angle reveals the insole, the inner side profile, and the heel "
-                "simultaneously — the classic Casadei product shot perspective."
+                "Low, ground-level angle, shooting almost parallel to the platform. "
+                "The camera is positioned slightly to the right, looking leftwards "
+                "at the shoes (3/4)."
             ),
             "staging_desc": (
-                "A matched pair of shoes placed side by side, BOTH pointing in the SAME "
-                "direction — toes facing forward-right, heels toward the camera-left. "
-                "The shoes are NOT mirrored and NOT facing each other. "
-                "They are parallel, with the left shoe slightly in front and the right "
-                "shoe slightly behind, touching side by side."
+                "A pair of shoes perfectly aligned and parallel, touching side by side, "
+                "both pointing in the same direction at the same angle."
             ),
         },
         "left": {
@@ -212,125 +207,161 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "hero-front-right": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-right of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and right side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe boxes of both shoes point toward the LEFT side of the frame; "
+                "the heels recede toward the RIGHT-BACK. "
+                "The RIGHT/OUTER sides of both shoes face the camera — the left/inner sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-right of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and outer side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the LEFT side of the frame; "
+                "the heel recedes toward the RIGHT-BACK. "
+                "The OUTER/LATERAL side of the left shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-right of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and outer side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the LEFT side of the frame; "
+                "the heel recedes toward the RIGHT-BACK. "
+                "The INNER/MEDIAL (arch) side of the right shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
     "hero-front-left": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-left of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and left side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe boxes of both shoes point toward the RIGHT side of the frame; "
+                "the heels recede toward the LEFT-BACK. "
+                "The LEFT/INNER sides of both shoes face the camera — the right/outer sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-left of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and inner side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the RIGHT side of the frame; "
+                "the heel recedes toward the LEFT-BACK. "
+                "The INNER/MEDIAL (arch) side of the left shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-left of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and inner side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the RIGHT side of the frame; "
+                "the heel recedes toward the LEFT-BACK. "
+                "The OUTER/LATERAL side of the right shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
     "hero-back-right": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-right of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel counter and right side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counters are in the LEFT-FRONT area of the frame; "
+                "the toe boxes recede toward the RIGHT-BACK. "
+                "The RIGHT/OUTER sides of both shoes face the camera — the left/inner sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-right of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and outer side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the LEFT-FRONT area of the frame; "
+                "the toe recedes toward the RIGHT-BACK. "
+                "The OUTER/LATERAL side of the left shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-right of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and outer side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the LEFT-FRONT area of the frame; "
+                "the toe recedes toward the RIGHT-BACK. "
+                "The INNER/MEDIAL (arch) side of the right shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
     "hero-back-left": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-left of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel counter and left side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counters are in the RIGHT-FRONT area of the frame; "
+                "the toe boxes recede toward the LEFT-BACK. "
+                "The LEFT/INNER sides of both shoes face the camera — the right/outer sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-left of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and inner side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the RIGHT-FRONT area of the frame; "
+                "the toe recedes toward the LEFT-BACK. "
+                "The INNER/MEDIAL (arch) side of the left shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-left of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and inner side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the RIGHT-FRONT area of the frame; "
+                "the toe recedes toward the LEFT-BACK. "
+                "The OUTER/LATERAL side of the right shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
 }
@@ -434,6 +465,31 @@ def _build_extra_specs_text(extra: dict[str, str]) -> str:
 
 MAX_ITERATIONS = 2
 
+_CAMERA_JUDGE_NOTES = (
+    "EVALUATE camera_angle using these steps in order:\n\n"
+    "STEP A — OBSERVE FIRST.\n"
+    "  Write your answers into observations[\"camera_angle\"] before scoring:\n"
+    "  - Which direction does the TOE BOX point in the frame? (LEFT / RIGHT / CENTER / AWAY)\n"
+    "  - Which part of the shoe is the primary subject facing the camera? "
+    "(toe box front / heel back / outer side / inner side / top)\n\n"
+    "STEP B — COMPARE to the spec.\n"
+    "  Read the spec carefully. Check ONLY what the spec explicitly states — "
+    "do not invent additional requirements that are not mentioned.\n"
+    "  Score 4-5: what you observed in Step A satisfies the spec's stated requirements.\n"
+    "  Score 3: the angle is mostly right but has a minor deviation from the spec.\n"
+    "  Score 1-2: the angle is clearly and fundamentally wrong "
+    "(e.g. spec says toe-front but heel is facing camera, or spec says left but toe points right).\n"
+    "  IMPORTANT: Be lenient with head-on front/rear/top views. "
+    "For a front view, seeing the interior (insole, straps) is normal and correct — "
+    "do NOT penalise a front view for showing the inside of the shoe. "
+    "Do NOT penalise camera height, exact elevation angle, Dutch tilt, or minor staging variations.\n\n"
+    "STEP C — REPAIR (only if score ≤ 3):\n"
+    "  State one concrete fix describing the required output state. "
+    "For angled shots: name which direction the toe must point (LEFT / RIGHT / CENTER) "
+    "and which part of the shoe should face the camera. "
+    "Do NOT write 'rotate' or 'adjust the camera' — only describe what the final image must show."
+)
+
 
 def _promote_spec_metadata(judge):
     """Wrap a bare spec judge so its _judge_metadata_spec is promoted to
@@ -489,18 +545,37 @@ def build_pipeline(
         spec={"camera_angle": camera_preset["camera_desc"] + " " + camera_preset["staging_desc"]},
         tolerance="generous",
         include_quality_features=False,
-        judge_notes=(
-            "Score camera_angle on overall viewpoint direction only. "
-            "Accept (score 4) if the general angle is correct — e.g. low 3/4 front, side profile, overhead. "
-            "Only reject (score 1-2) if the viewpoint is completely wrong (e.g. front view instead of 3/4, top-down instead of side). "
-            "Ignore minor differences in exact position, tilt, or staging arrangement."
-        ),
+        judge_notes=_CAMERA_JUDGE_NOTES,
     )
+
+    count_judge = make_shoe_count_judge(
+        session=vlm_session,
+        foot=foot,
+        candidate_key="image",
+    )
+
+    def _combined_judge(context):
+        count_accepted, count_fb = count_judge(context)
+        cam_accepted, cam_fb = camera_judge(context)
+        # Promote camera metadata for best_fn
+        meta = context.pop("_judge_metadata_spec", {})
+        context["_judge_metadata"] = {
+            "sketch_avg": None,
+            "spec_scores": meta.get("scores", {}),
+            "spec_avg": meta.get("avg_score"),
+        }
+        accepted = count_accepted and cam_accepted
+        parts = []
+        if not count_accepted and count_fb and count_fb != "none":
+            parts.append(f"Shoe count issue: {count_fb}")
+        if not cam_accepted and cam_fb and cam_fb != "none":
+            parts.append(f"Camera angle issue: {cam_fb}")
+        return accepted, "\n".join(parts) if parts else "none"
 
     loop = LoopStep(
         name="angle_correction_loop",
         body=[edit_step],
-        judge=_promote_spec_metadata(camera_judge),
+        judge=_combined_judge,
         max_iterations=MAX_ITERATIONS,
         best_fn=make_best_fn(
             session=vlm_session,
@@ -536,7 +611,7 @@ def save_results(
         "timestamp": datetime.now().isoformat(),
         "total_elapsed_s": total_elapsed,
         "model": "gemini_flash_image_edit",
-        "angle_judge": "gemini_flash_lite",
+        "angle_judge": "gemini_flash",
         "foot": foot,
         "spec": spec,
         "total_iterations": len(loop_result.iterations),
@@ -589,7 +664,7 @@ def save_results(
         f"Date: {datetime.now().isoformat()}",
         f"Total time: {total_elapsed:.1f}s",
         f"Model: gemini_flash_image_edit",
-        f"Angle judge: gemini_flash_lite  (camera angle only, max {MAX_ITERATIONS} iter)",
+        f"Angle judge: gemini_flash  (camera angle only, max {MAX_ITERATIONS} iter)",
         f"Foot output:  {foot}",
         f"Material: {spec.get('material')}  Angle: {spec.get('camera_angle')}",
         f"Iterations: {len(loop_result.iterations)}",
@@ -679,7 +754,7 @@ def main():
         print(f"Extra spec:    {extra_spec}")
     print(f"Scale:         {args.scale}x")
     print(f"Model:         gemini_flash_image_edit (temperature={args.temperature})")
-    print(f"Angle judge:   gemini_flash_lite (camera angle only, max {MAX_ITERATIONS} iter)")
+    print(f"Angle judge:   gemini_flash (camera angle only, max {MAX_ITERATIONS} iter)")
     print()
 
     raw_sketches = []
@@ -702,7 +777,7 @@ def main():
         "extra": extra_spec,
     }
 
-    vlm_session = VLMSession("gemini_flash_lite")
+    vlm_session = VLMSession("gemini_flash")
     sketch_media = ImageMedia(image=sketch_grid)
 
     pipeline, edit_agent = build_pipeline(
