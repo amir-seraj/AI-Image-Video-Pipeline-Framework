@@ -35,6 +35,7 @@ from casadei import (
     LoggedPipeline, Pipeline,
 )
 from casadei.loop import LoopStep, LoopResult
+from casadei.providers.gemini_pricing import format_usage_summary
 from judge import VLMSession, make_judge, make_best_fn, extract_features
 
 IMAGE_DIR = Path(__file__).parent / "Image"
@@ -55,8 +56,12 @@ def build_pipeline(
     vlm_session: VLMSession | None = None,
     features: list[str] | None = None,
     tolerance: str = "strict",
-) -> Pipeline:
-    """Build the iterative shoe replacement pipeline using Gemini models."""
+) -> tuple[Pipeline, Agent]:
+    """Build the iterative shoe replacement pipeline using Gemini models.
+
+    Returns (pipeline, image_edit_agent) so callers can read the agent's
+    token_usage_log after the run.
+    """
     if vlm_session is None:
         vlm_session = VLMSession("gemini_flash_lite")
 
@@ -103,7 +108,7 @@ def build_pipeline(
         feedback_template_var="feedback",
     )
 
-    return Pipeline(name="shoe_tryon_gemini", steps=[loop])
+    return Pipeline(name="shoe_tryon_gemini", steps=[loop]), gemini_edit_agent
 
 
 def save_results(
@@ -116,6 +121,7 @@ def save_results(
     total_elapsed: float,
     features: list[str] | None = None,
     tolerance: str = "strict",
+    token_records: list[dict] | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,6 +178,14 @@ def save_results(
             if isinstance(best_reason, TextMedia):
                 results_data["best_selection_vlm_response"] = best_reason.text
 
+    # Token usage and pricing
+    if token_records:
+        usage_summary = format_usage_summary(token_records)
+        results_data["token_usage"] = {
+            "records": token_records,
+            "summary": usage_summary,
+        }
+
     (run_dir / "results.json").write_text(
         json.dumps(results_data, indent=2, default=str)
     )
@@ -206,6 +220,29 @@ def save_results(
         lines.append("")
 
     lines.append(f"Final verdict: {results_data.get('final_verdict', 'unknown')}")
+
+    # Token usage summary
+    if token_records:
+        usage_summary = format_usage_summary(token_records)
+        lines.append("")
+        lines.append("Token Usage & Pricing")
+        lines.append("-" * 40)
+        for mid, totals in usage_summary["by_model"].items():
+            lines.append(f"  {mid}:")
+            lines.append(f"    Calls:      {totals['calls']}")
+            lines.append(f"    Input:      {totals['input_tokens']:,} tokens")
+            lines.append(f"    Output:     {totals['output_tokens']:,} tokens")
+            if totals['thinking_tokens']:
+                lines.append(f"    Thinking:   {totals['thinking_tokens']:,} tokens")
+            if totals['cached_tokens']:
+                lines.append(f"    Cached:     {totals['cached_tokens']:,} tokens")
+            lines.append(f"    Total:      {totals['total_tokens']:,} tokens")
+            lines.append(f"    Cost:       ${totals['cost_usd']:.6f}")
+        gt = usage_summary["grand_total"]
+        lines.append(f"  ---")
+        lines.append(f"  Grand total:  {gt['total_tokens']:,} tokens  |  "
+                      f"${gt['cost_usd']:.6f}  |  {gt['calls']} API calls")
+
     lines.append(f"Output: {run_dir}")
 
     summary = "\n".join(lines)
@@ -278,7 +315,7 @@ def main():
     print(f"Features: {features}")
     print()
 
-    pipeline = build_pipeline(
+    pipeline, edit_agent = build_pipeline(
         max_iterations=args.max_iter,
         vlm_session=vlm_session,
         features=features,
@@ -307,6 +344,9 @@ def main():
     loop_result = result.get("tryon_loop_history")
     final_img = result.get("image")
 
+    # Collect all token usage records
+    token_records = vlm_session.token_usage_log + edit_agent.token_usage_log
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = OUTPUT_DIR / f"{args.max_iter}iter_{ts}"
 
@@ -320,6 +360,7 @@ def main():
         total_elapsed=total_elapsed,
         features=features,
         tolerance=args.tolerance,
+        token_records=token_records,
     )
 
     print(f"\nDone. Results saved to: {run_dir}")

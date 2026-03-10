@@ -63,15 +63,18 @@ class Variation(BaseModel):
     results: list[ResultFile] = []
     generated_results: list[GeneratedResult] = []
     spin_frames: list[ResultFile] = []
-    tags: list[str] = []
-    price: float | None = None
+    spin_video: str = ""
+    price_tier: str = ""
+    theme: str = ""
+    feature: str = ""
     status: JobStatus = JobStatus.pending
     created_at: datetime = Field(default_factory=_utcnow)
 
 
 class UpdateVariationMetaRequest(BaseModel):
-    tags: list[str] | None = None
-    price: float | None = Field(default=None)
+    price_tier: str | None = None
+    theme: str | None = None
+    feature: str | None = None
 
 
 class Product(BaseModel):
@@ -105,9 +108,9 @@ class Collection(BaseModel):
     id: str = Field(default_factory=_new_id)
     name: str
     product_ids: list[str] = []
-    price_min: float | None = None
-    price_max: float | None = None
-    target_tags: list[str] = []
+    target_price_tiers: list[str] = []
+    target_themes: list[str] = []
+    target_features: list[str] = []
     target_description: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -118,9 +121,9 @@ class CreateCollectionRequest(BaseModel):
 
 class UpdateCollectionRequest(BaseModel):
     name: str | None = None
-    price_min: float | None = None
-    price_max: float | None = None
-    target_tags: list[str] | None = None
+    target_price_tiers: list[str] | None = None
+    target_themes: list[str] | None = None
+    target_features: list[str] | None = None
     target_description: str | None = None
 
 
@@ -227,3 +230,31 @@ class PipelineUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     steps: list[PipelineStepRequest] | None = None
+
+
+# --- Search ---
+
+
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 3
+    min_similarity: float = 0.5
+
+
+class SearchResult(BaseModel):
+    product_id: str
+    variation_id: str
+    text: str
+    similarity: float
+
+
+class SearchResponse(BaseModel):
+    query: str
+    normalized_query: str
+    results: list[SearchResult]
+    cached: bool = False
+
+
+class IndexStats(BaseModel):
+    indexed_variants: int
+    cached_queries: int

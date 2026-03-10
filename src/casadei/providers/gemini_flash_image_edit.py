@@ -17,6 +17,7 @@ from PIL import Image as PILImage
 
 from casadei.models.base import ModelCapability, ImageConstraint, TextConstraint
 from casadei.models.image_edit import ImageEditModel
+from casadei.providers.gemini_pricing import extract_token_usage
 
 try:
     from google import genai
@@ -111,11 +112,13 @@ class GeminiFlashImageEdit(ImageEditModel):
         ],
     )
 
+    DEFAULT_TEMPERATURE = 1.0  # Gemini API default
     DEFAULT_PARAMS: dict = {}
 
     def __init__(self) -> None:
         super().__init__()
         self._client = None
+        self.last_token_usage: dict[str, int] | None = None
 
     def load_model(self) -> None:
         if genai is None:
@@ -151,15 +154,21 @@ class GeminiFlashImageEdit(ImageEditModel):
             images[0].size, target_size, aspect_ratio_str,
         )
 
+        temperature = kwargs.get("temperature", self.DEFAULT_TEMPERATURE)
+
         response = self._client.models.generate_content(
             model=self.MODEL_ID,
             contents=[prompt] + padded,
             config=genai_types.GenerateContentConfig(
+                temperature=temperature,
                 image_config=genai_types.ImageConfig(
                     image_size="1K",
                     aspect_ratio=aspect_ratio_str,
                 ),
             ),
+        )
+        self.last_token_usage = extract_token_usage(
+            getattr(response, "usage_metadata", None)
         )
 
         for part in response.parts:

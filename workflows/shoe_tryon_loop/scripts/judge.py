@@ -264,6 +264,20 @@ class VLMSession:
         self._model_name = model_name
         self._model = None
         self._persistent = False
+        self.token_usage_log: list[dict] = []
+
+    def record_usage(self, label: str = "") -> None:
+        """Append the model's last_token_usage (if any) to the log."""
+        model = self._model
+        if model is None:
+            return
+        usage = getattr(model, "last_token_usage", None)
+        if usage:
+            self.token_usage_log.append({
+                "label": label,
+                "model": getattr(model, "MODEL_ID", self._model_name),
+                **usage,
+            })
 
     def load(self) -> None:
         """Pre-load the model (keep-both mode). Call once before the loop."""
@@ -319,6 +333,7 @@ def extract_features(session: VLMSession, shoe_image: ImageMedia) -> list[str]:
     model = session.acquire()
     try:
         response = _stream_vlm(model, bundle, label="Feature Extraction")
+        session.record_usage("Feature Extraction")
     finally:
         session.release()
 
@@ -445,6 +460,7 @@ def make_judge(
                     })
 
                 raw_response = _stream_vlm(model, bundle, label="VLM Judge")
+                session.record_usage("VLM Judge")
 
                 try:
                     scores = _parse_scores(raw_response)
@@ -793,6 +809,7 @@ def make_multi_judge(
                         })
 
                     raw = _stream_vlm(model, bundle, label=agent_name)
+                    session.record_usage(agent_name)
 
                     try:
                         scores = _parse_scores(raw)
@@ -845,6 +862,7 @@ def make_multi_judge(
                 synthesized_repair = _synthesize_firered_prompt(
                     model, reference, _agents_for_synth, _passing_names,
                 )
+                session.record_usage("Synthesis")
         finally:
             session.release()
 
@@ -1004,6 +1022,7 @@ def make_best_fn(
 
             for attempt in range(_MAX_RETRIES + 1):
                 response = _stream_vlm(model, bundle, label="VLM Best-of-N")
+                session.record_usage("VLM Best-of-N")
 
                 # Parse: find a number 1..n on the first line
                 first_line = response.splitlines()[0] if response else ""

@@ -120,6 +120,15 @@ class Qwen3VL8B(VisionLanguageModel):
 
         _fix_corrupt_configs(LOCAL_DIR)
 
+        # Ensure CUDA/cuBLAS is initialized before loading the model
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            # Warm up cuBLAS with a small matmul to force handle creation
+            _dummy = torch.zeros(1, 1, device="cuda", dtype=torch.bfloat16)
+            _ = _dummy @ _dummy.T
+            del _dummy
+            torch.cuda.empty_cache()
+
         logger.info("Loading Qwen3-VL-8B-Instruct from %s", LOCAL_DIR)
         self._processor = Qwen3VLProcessor.from_pretrained(str(LOCAL_DIR))
         self._model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -131,10 +140,18 @@ class Qwen3VL8B(VisionLanguageModel):
         logger.info("Qwen3-VL-8B-Instruct loaded.")
 
     def unload_model(self) -> None:
+        import gc
+
+        if self._model is not None:
+            del self._model
+        if self._processor is not None:
+            del self._processor
         self._model = None
         self._processor = None
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
     def _prepare_inputs(
         self, images: list[PILImage.Image], prompt: str

@@ -16,10 +16,14 @@ Usage:
 
 import argparse
 import gc
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+# Must be set before importing torch / initialising CUDA allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from PIL import Image as PILImage
@@ -170,6 +174,10 @@ def main():
             print(f" {wall:.2f}s  (GPU {gpu_ms:.0f}ms, peak {peak:.2f}GB)")
 
             results.append(TimingResult(label, registry_name, load_s, wall, gpu_ms, peak, size_str))
+
+        except KeyboardInterrupt:
+            print("\n  Interrupted by user.")
+            break
 
         except Exception as e:
             print(f"\n  SKIPPED — {type(e).__name__}: {e}")

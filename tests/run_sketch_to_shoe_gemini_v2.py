@@ -1,21 +1,22 @@
-"""Sketch-to-shoe agentic loop — Gemini version.
+"""Sketch-to-shoe agentic loop — Gemini v2 (holistic judge, no feature extraction).
 
 Converts design sketches + spec (material, color, camera angle, extras) into
 a photorealistic studio product photograph using Gemini Flash Image Edit
-for generation and Gemini Flash VLM for dual judgment (sketch fidelity +
-spec compliance). Both models are API-based (no GPU required).
-Reads GEMINI_API_KEY from the .env file.
+for generation and a single holistic Gemini Flash VLM judge that evaluates
+structure, materials, and photography all in one pass.
+
+No feature extraction step — the judge compares the rendered image directly
+against the sketch image and the spec text. Simpler, more robust.
 
 Usage:
-    python tests/run_sketch_to_shoe_gemini.py --sketches tests/Image/sketch001.png
-    python tests/run_sketch_to_shoe_gemini.py \\
+    python tests/run_sketch_to_shoe_gemini_v2.py --sketches tests/Image/sketch001.png
+    python tests/run_sketch_to_shoe_gemini_v2.py \\
         --sketches s1.png s2.png \\
-        --material "beige suede" --camera-angle "3/4 view" \\
+        --material "beige suede" --camera-angle "3/4" \\
         --spec style=elegant note="chunky platform"
-    python tests/run_sketch_to_shoe_gemini.py --max-iter 3 --tolerance moderate
-    python tests/run_sketch_to_shoe_gemini.py --foot pair   # both shoes (default)
-    python tests/run_sketch_to_shoe_gemini.py --foot left   # left shoe only
-    python tests/run_sketch_to_shoe_gemini.py --foot right  # right shoe only
+    python tests/run_sketch_to_shoe_gemini_v2.py --max-iter 3
+    python tests/run_sketch_to_shoe_gemini_v2.py --foot pair   # both shoes (default)
+    python tests/run_sketch_to_shoe_gemini_v2.py --foot left   # left shoe only
 """
 
 from __future__ import annotations
@@ -44,36 +45,32 @@ from casadei import (
 )
 from casadei.loop import LoopStep, LoopResult
 from casadei.providers.gemini_pricing import format_usage_summary
-from judge import (
-    VLMSession,
-    make_sketch_judge,
-    make_spec_judge,
-    make_dual_judge,
-    make_best_fn,
-)
+from judge import VLMSession, make_best_fn
+from judge_simple import make_holistic_judge
 
 IMAGE_DIR = Path(__file__).parent / "Image"
-OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_gemini"
+OUTPUT_DIR = Path(__file__).parent / "output" / "sketch_to_shoe_gemini_v2"
 
+# Simplified prompt: no feature list, just sketch image as direct reference
 PROMPT_TEMPLATE = (
-    "Generate a studio product photo of the shoe shown in the sketch.\n"
-    "Study the sketch carefully before generating. "
-    "Reproduce every line and every open area exactly as drawn — "
-    "if a structural part is not drawn in the sketch, it must not appear in the photo. "
-    "Do not add, complete, or assume any structure that is absent from the sketch. "
-    "Apply the materials below on top of the sketch shape. "
-    "Shoot at the specified camera angle — do not copy the sketch's viewpoint.\n\n"
-    "Materials: $material\n\n"
-    "Camera angle: $camera_desc\n"
-    "Staging: $staging_desc\n"
-    "$extra_specs\n"
-    "Clean white background, professional studio lighting, sharp focus. "
+    "IMAGE 1 is the original shoe design sketch. It is the ABSOLUTE SOURCE OF TRUTH "
+    "for the shoe's silhouette, structure, strap placement, heel type, toe shape, "
+    "and all construction elements. Reproduce the sketch's design exactly — "
+    "the sketch always wins over any other instruction.\n\n"
+    "MATERIAL & SURFACE FINISH:\n"
+    "$material\n\n"
+    "PHOTOGRAPHY SETUP:\n"
+    "- Camera angle: $camera_desc\n"
+    "- Shoe alignment and staging: $staging_desc\n"
+    "$extra_specs\n\n"
+    "The result must be a studio-quality photograph: clean white background, "
+    "professional product lighting, sharp focus, no shadows on background. "
     "$foot_framing\n"
     "$feedback"
 )
 
 # ---------------------------------------------------------------------------
-# Camera angle presets — deterministic prompt fragments per angle
+# Camera angle presets — identical to v1
 # ---------------------------------------------------------------------------
 
 CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
@@ -96,8 +93,8 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "judge_note": (
                 "EVALUATION NOTE: In a correct 3/4 pair shot the left shoe naturally shows "
                 "its inner arch/insole and the right shoe shows its outer lateral side — "
-                "this asymmetry is CORRECT and must NOT be scored as mirrored. "
-                "Score 2 ONLY if the shoes form a V-shape with toes pointing toward each other."
+                "this asymmetry is CORRECT and must NOT be judged as mirrored. "
+                "Only flag as wrong if the shoes form a V-shape with toes pointing toward each other."
             ),
         },
         "left": {
@@ -239,8 +236,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the front-right of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and outer side "
-                "of the left shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The left shoe filling the frame with presence.",
         },
@@ -248,8 +244,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the front-right of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and outer side "
-                "of the right shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The right shoe filling the frame with presence.",
         },
@@ -259,8 +254,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the front-left of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and left side "
-                "of the shoes are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": (
                 "A pair of shoes on the white surface, filling the frame with presence."
@@ -270,8 +264,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the front-left of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and inner side "
-                "of the left shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The left shoe filling the frame with presence.",
         },
@@ -279,8 +272,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the front-left of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and inner side "
-                "of the right shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The right shoe filling the frame with presence.",
         },
@@ -290,8 +282,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the back-right of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel counter and right side "
-                "of the shoes are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": (
                 "A pair of shoes on the white surface, filling the frame with presence."
@@ -301,8 +292,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the back-right of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and outer side "
-                "of the left shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The left shoe filling the frame with presence.",
         },
@@ -310,8 +300,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the back-right of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and outer side "
-                "of the right shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The right shoe filling the frame with presence.",
         },
@@ -321,8 +310,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the back-left of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel counter and left side "
-                "of the shoes are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": (
                 "A pair of shoes on the white surface, filling the frame with presence."
@@ -332,8 +320,7 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the back-left of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and inner side "
-                "of the left shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The left shoe filling the frame with presence.",
         },
@@ -341,15 +328,14 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
             "camera_desc": (
                 "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
                 "positioned at the back-left of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and inner side "
-                "of the right shoe are prominent."
+                "Slight Dutch tilt for editorial drama."
             ),
             "staging_desc": "The right shoe filling the frame with presence.",
         },
     },
 }
 
-# Aliases for convenience
+# Aliases
 CAMERA_PRESETS["3/4 view"] = CAMERA_PRESETS["3/4"]
 CAMERA_PRESETS["side view"] = CAMERA_PRESETS["side"]
 CAMERA_PRESETS["front view"] = CAMERA_PRESETS["front"]
@@ -357,25 +343,11 @@ CAMERA_PRESETS["back view"] = CAMERA_PRESETS["back"]
 CAMERA_PRESETS["top view"] = CAMERA_PRESETS["top"]
 CAMERA_PRESETS["hero"] = CAMERA_PRESETS["hero-front-right"]
 
-CANONICAL_ANGLES = [
-    "3/4", "side", "front", "back", "top",
-    "hero-front-right", "hero-front-left", "hero-back-right", "hero-back-left",
-]
-
-# Angles that naturally show a pair vs a single shoe
-PAIR_ANGLES = {"3/4", "front"}
-SINGLE_ANGLES = {
-    "side", "back", "top",
-    "hero-front-right", "hero-front-left", "hero-back-right", "hero-back-left",
-}
-
 
 def _get_camera_preset(angle: str, foot: str = "pair") -> dict[str, str]:
-    """Look up camera preset by angle and foot. Falls back to raw angle string."""
     key = angle.lower().strip()
     if key in CAMERA_PRESETS:
         return CAMERA_PRESETS[key][foot]
-    # Fallback: use the raw angle as-is (user provided a custom description)
     return {
         "camera_desc": angle,
         "staging_desc": "The shoe(s) placed on the white surface.",
@@ -406,7 +378,6 @@ def _build_sketch_grid(
     images: list[PILImage.Image],
     spacing: int = 20,
 ) -> PILImage.Image:
-    """Arrange sketch images in a rectangular grid, then pad to square."""
     if not images:
         raise ValueError("No sketch images provided.")
 
@@ -443,7 +414,6 @@ def _build_sketch_grid(
 # ---------------------------------------------------------------------------
 
 def _parse_spec_args(spec_list: list[str]) -> dict[str, str]:
-    """Parse KEY=VALUE strings from --spec CLI args."""
     result = {}
     for item in spec_list:
         if "=" in item:
@@ -453,7 +423,6 @@ def _parse_spec_args(spec_list: list[str]) -> dict[str, str]:
 
 
 def _build_extra_specs_text(extra: dict[str, str]) -> str:
-    """Format extra spec dict as bullet lines for the prompt."""
     if not extra:
         return ""
     return "\n".join(f"- {k.capitalize()}: {v}" for k, v in extra.items())
@@ -468,23 +437,18 @@ def build_pipeline(
     spec: dict,
     max_iterations: int = 5,
     vlm_session: VLMSession | None = None,
-    sketch_vlm_session: VLMSession | None = None,
-    sketch_features: list[str] | None = None,
-    tolerance: str = "strict",
     foot: str = "pair",
-    temperature: float = 0.8,
 ) -> tuple[Pipeline, Agent]:
-    """Build the iterative sketch-to-shoe pipeline using Gemini models.
+    """Build the iterative sketch-to-shoe pipeline using holistic judge.
 
-    Returns (pipeline, image_edit_agent) so callers can read the agent's
-    token_usage_log after the run.
+    Returns (pipeline, image_edit_agent).
     """
     if vlm_session is None:
         vlm_session = VLMSession("gemini_flash_lite")
-    if sketch_vlm_session is None:
-        sketch_vlm_session = vlm_session
 
     extra_specs_text = _build_extra_specs_text(spec.get("extra", {}))
+    camera_preset = _get_camera_preset(spec.get("camera_angle", _default_camera_angle(foot)), foot)
+    _camera_judge_note = camera_preset.get("judge_note", "")
 
     gemini_agent = Agent(AgentConfig(
         name="gemini_sketch_to_shoe",
@@ -492,28 +456,27 @@ def build_pipeline(
         description="Gemini Flash image edit for sketch-to-shoe generation",
         prompt_template=PROMPT_TEMPLATE,
         negative_prompt="",
-        params={"temperature": temperature},
+        params={},
     ))
 
     edit_step = AgentStep(
         name="gemini_generate",
         agent=gemini_agent,
         input_map={
-            "image": "sketch",  # always the original sketch (constant reference)
-            "image_2": "image", # first iter: sketch (seeded); subsequent: last generation
+            "image": "sketch",   # always the original sketch (constant reference)
+            "image_2": "image",  # first iter: sketch (seeded); subsequent: last generation
         },
         output_map={"image": "image"},
         template_kwargs={
             "material": spec.get("material", "black patent leather"),
-            **_get_camera_preset(spec.get("camera_angle", _default_camera_angle(foot)), foot),
+            **camera_preset,
             "extra_specs": extra_specs_text,
             "foot_framing": _foot_framing(foot),
             "feedback": "",
         },
     )
 
-    camera_preset = _get_camera_preset(spec.get("camera_angle", _default_camera_angle(foot)), foot)
-    _camera_judge_note = camera_preset.get("judge_note", "")
+    # Build spec dict for the judge (camera_angle as plain description)
     full_spec = {
         "material": spec.get("material", "black patent leather"),
         "camera_angle": " ".join(filter(None, [
@@ -523,27 +486,18 @@ def build_pipeline(
         **spec.get("extra", {}),
     }
 
-    dual_judge = make_dual_judge(
-        make_sketch_judge(
-            session=sketch_vlm_session,
-            sketch_key="sketch",
-            candidate_key="image",
-            features=sketch_features,
-            tolerance=tolerance,
-        ),
-        make_spec_judge(
-            session=vlm_session,
-            candidate_key="image",
-            spec=full_spec,
-            tolerance=tolerance,
-            judge_notes=_camera_judge_note,
-        ),
+    holistic_judge = make_holistic_judge(
+        session=vlm_session,
+        sketch_key="sketch",
+        candidate_key="image",
+        spec=full_spec,
+        judge_notes=_camera_judge_note,
     )
 
     loop = LoopStep(
         name="sketch_to_shoe_loop",
         body=[edit_step],
-        judge=dual_judge,
+        judge=holistic_judge,
         max_iterations=max_iterations,
         best_fn=make_best_fn(
             session=vlm_session,
@@ -555,7 +509,7 @@ def build_pipeline(
         feedback_template_var="feedback",
     )
 
-    return Pipeline(name="sketch_to_shoe_gemini", steps=[loop]), gemini_agent
+    return Pipeline(name="sketch_to_shoe_gemini_v2", steps=[loop]), gemini_agent
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +524,6 @@ def save_results(
     final_img: ImageMedia | None,
     spec: dict,
     total_elapsed: float,
-    sketch_features: list[str] | None = None,
-    tolerance: str = "strict",
     foot: str = "pair",
     token_records: list[dict] | None = None,
 ) -> None:
@@ -581,14 +533,13 @@ def save_results(
     results_data = {
         "timestamp": datetime.now().isoformat(),
         "total_elapsed_s": total_elapsed,
+        "judge": "holistic_v2",
         "models": {
             "image_edit": "gemini_flash_image_edit",
             "vlm_judge": "gemini_flash_lite",
         },
         "foot": foot,
         "spec": spec,
-        "sketch_features": sketch_features or [],
-        "tolerance": tolerance,
         "total_iterations": len(loop_result.iterations),
         "iterations": [],
     }
@@ -600,13 +551,6 @@ def save_results(
             "feedback": it.feedback,
             "duration_ms": it.duration_ms,
         }
-        meta = it.metadata
-        if meta:
-            iter_data["sketch_scores"] = meta.get("sketch_scores", {})
-            iter_data["sketch_avg"] = meta.get("sketch_avg")
-            iter_data["spec_scores"] = meta.get("spec_scores", {})
-            iter_data["spec_avg"] = meta.get("spec_avg")
-
         candidate_img = it.outputs.get("image")
         if isinstance(candidate_img, ImageMedia):
             img_path = run_dir / f"iter_{it.index:02d}_candidate.png"
@@ -631,7 +575,6 @@ def save_results(
             if isinstance(best_reason, TextMedia):
                 results_data["best_selection_vlm_response"] = best_reason.text
 
-    # Token usage and pricing
     if token_records:
         usage_summary = format_usage_summary(token_records)
         results_data["token_usage"] = {
@@ -644,38 +587,25 @@ def save_results(
     )
 
     lines = [
-        "Sketch-to-Shoe Loop Results — Gemini",
+        "Sketch-to-Shoe Loop Results — Gemini v2 (Holistic Judge)",
         "=" * 60,
         f"Date: {datetime.now().isoformat()}",
         f"Total time: {total_elapsed:.1f}s",
         f"Image edit model: gemini_flash_image_edit",
-        f"VLM judge model:  gemini_flash_lite",
+        f"VLM judge model:  gemini_flash_lite (holistic)",
         f"Foot output:  {foot}",
         f"Material: {spec.get('material')}  Angle: {spec.get('camera_angle')}",
-        f"Sketch features: {sketch_features or []}",
-        f"Tolerance: {tolerance}",
         f"Iterations: {len(loop_result.iterations)}",
         "",
     ]
     for it in loop_result.iterations:
         verdict = "ACCEPT" if it.accepted else "REJECT"
         lines.append(f"  Iteration {it.index}: {verdict} ({it.duration_ms:.1f}ms)")
-        meta = it.metadata
-        if meta:
-            if meta.get("sketch_scores"):
-                ss = meta["sketch_scores"]
-                lines.append(f"    Sketch: {', '.join(f'{k}={v}' for k,v in ss.items())} "
-                              f"(avg={meta.get('sketch_avg')})")
-            if meta.get("spec_scores"):
-                ss = meta["spec_scores"]
-                lines.append(f"    Spec:   {', '.join(f'{k}={v}' for k,v in ss.items())} "
-                              f"(avg={meta.get('spec_avg')})")
         lines.append(f"    Feedback: {it.feedback}")
         lines.append("")
 
     lines.append(f"Final verdict: {results_data.get('final_verdict', 'unknown')}")
 
-    # Token usage summary
     if token_records:
         usage_summary = format_usage_summary(token_records)
         lines.append("")
@@ -686,9 +616,9 @@ def save_results(
             lines.append(f"    Calls:      {totals['calls']}")
             lines.append(f"    Input:      {totals['input_tokens']:,} tokens")
             lines.append(f"    Output:     {totals['output_tokens']:,} tokens")
-            if totals['thinking_tokens']:
+            if totals["thinking_tokens"]:
                 lines.append(f"    Thinking:   {totals['thinking_tokens']:,} tokens")
-            if totals['cached_tokens']:
+            if totals["cached_tokens"]:
                 lines.append(f"    Cached:     {totals['cached_tokens']:,} tokens")
             lines.append(f"    Total:      {totals['total_tokens']:,} tokens")
             lines.append(f"    Cost:       ${totals['cost_usd']:.6f}")
@@ -709,32 +639,27 @@ def save_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sketch-to-shoe agentic loop — Gemini Flash (image edit + VLM judge)"
+        description="Sketch-to-shoe agentic loop — Gemini v2 (holistic judge)"
     )
     parser.add_argument("--sketches", type=str, nargs="+", required=True,
         help="Path(s) to sketch image(s)")
     parser.add_argument("--material", type=str, default="black patent leather",
-        help="Shoe material and color (e.g. 'black leather', 'beige suede', 'white canvas')")
+        help="Shoe material and color description")
     parser.add_argument("--foot", type=str, default="pair",
         choices=["pair", "left", "right"],
         help="Output: 'pair' for both shoes (default), 'left' or 'right' for a single shoe")
     parser.add_argument("--camera-angle", type=str, default=None,
         dest="camera_angle",
         help="Camera angle preset: 3/4, side, front, back, top, hero "
-             "(or any custom string). Default: 3/4. "
-             "Foot variation (pair/left/right) is selected via --foot.")
+             "(or any custom string). Default: 3/4.")
     parser.add_argument("--spec", type=str, nargs="*", default=[],
         metavar="KEY=VALUE",
         help="Open-ended extras, e.g. style=elegant note='chunky sole'")
-    parser.add_argument("--max-iter", type=int, default=3)
-    parser.add_argument("--tolerance", type=str, default="moderate",
-        choices=["generous", "moderate", "strict"])
+    parser.add_argument("--max-iter", type=int, default=2)
     parser.add_argument("--scale", type=float, default=1.0,
         help="Scale factor for sketch images (default: 1.0)")
     parser.add_argument("--spacing", type=int, default=20,
         help="Pixel spacing between sketches in grid (default: 20)")
-    parser.add_argument("--temperature", type=float, default=0.8,
-        help="Generation temperature for Gemini image edit (default: 0.8, model default: 1.0)")
     args = parser.parse_args()
 
     if not os.environ.get("GEMINI_API_KEY"):
@@ -743,7 +668,7 @@ def main():
 
     camera_angle = args.camera_angle or _default_camera_angle(args.foot)
 
-    print("=== Sketch-to-Shoe Agentic Loop — Gemini ===")
+    print("=== Sketch-to-Shoe Agentic Loop — Gemini v2 (Holistic Judge) ===")
     print(f"Sketches:      {args.sketches}")
     print(f"Foot output:   {args.foot}")
     print(f"Material:      {args.material}")
@@ -752,11 +677,9 @@ def main():
     if extra_spec:
         print(f"Extra spec:    {extra_spec}")
     print(f"Max iterations:{args.max_iter}")
-    print(f"Tolerance:     {args.tolerance}")
     print(f"Scale:         {args.scale}x")
-    print(f"Image edit:    gemini_flash_image_edit (Nano Banana 2, temperature={args.temperature})")
-    print(f"Sketch judge:  gemini_flash (Gemini 3.0 Flash)")
-    print(f"Spec judge:    gemini_flash_lite (Gemini 3.1 Flash Lite)")
+    print(f"Image edit:    gemini_flash_image_edit")
+    print(f"VLM judge:     gemini_flash_lite (holistic — no feature extraction)")
     print()
 
     raw_sketches = []
@@ -780,7 +703,6 @@ def main():
     }
 
     vlm_session = VLMSession("gemini_flash_lite")
-    sketch_vlm_session = VLMSession("gemini_flash_lite")
     sketch_media = ImageMedia(image=sketch_grid)
 
     pipeline, edit_agent = build_pipeline(
@@ -788,25 +710,18 @@ def main():
         spec=spec,
         max_iterations=args.max_iter,
         vlm_session=vlm_session,
-        sketch_vlm_session=sketch_vlm_session,
-        sketch_features=None,
-        tolerance=args.tolerance,
         foot=args.foot,
-        temperature=args.temperature,
     )
-    logged = LoggedPipeline(pipeline)
 
-    context = {
-        "sketch": sketch_media,
-        "image": sketch_media,  # seed for first iteration
-    }
-
+    logged_pipeline = LoggedPipeline(pipeline)
     t0 = time.perf_counter()
 
-    try:
-        result, exec_log = logged.run(context)
-    finally:
-        vlm_session.unload()
+    initial_context = {
+        "sketch": sketch_media,
+        "image": sketch_media,   # seed: first generation uses sketch as starting point
+    }
+
+    result, exec_log = logged_pipeline.run(initial_context)
 
     total_elapsed = time.perf_counter() - t0
 
@@ -815,12 +730,7 @@ def main():
     loop_result = result.get("sketch_to_shoe_loop_history")
     final_img = result.get("image")
 
-    # Collect all token usage records
-    token_records = (
-        sketch_vlm_session.token_usage_log
-        + vlm_session.token_usage_log
-        + edit_agent.token_usage_log
-    )
+    token_records = vlm_session.token_usage_log + edit_agent.token_usage_log
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = OUTPUT_DIR / f"{args.max_iter}iter_{ts}"
@@ -833,8 +743,6 @@ def main():
         final_img=final_img,
         spec=spec,
         total_elapsed=total_elapsed,
-        sketch_features=None,
-        tolerance=args.tolerance,
         foot=args.foot,
         token_records=token_records,
     )

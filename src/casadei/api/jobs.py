@@ -78,6 +78,14 @@ class JobManager:
             if event in listeners:
                 listeners.remove(event)
 
+    def list_active(self) -> list[JobState]:
+        """Return all jobs that are still pending or running."""
+        with self._lock:
+            return [
+                j for j in self._jobs.values()
+                if j.status in ("pending", "running")
+            ]
+
     def _notify(self, job_id: str) -> None:
         with self._lock:
             for event in self._events.get(job_id, []):

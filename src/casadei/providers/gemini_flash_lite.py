@@ -17,6 +17,7 @@ from PIL import Image as PILImage
 
 from casadei.models.base import ModelCapability, ImageConstraint, TextConstraint
 from casadei.models.vision_language import VisionLanguageModel
+from casadei.providers.gemini_pricing import extract_token_usage
 
 try:
     from google import genai
@@ -57,6 +58,8 @@ class GeminiFlashLite(VisionLanguageModel):
     def __init__(self) -> None:
         super().__init__()
         self._client = None
+        self.last_token_usage: dict[str, int] | None = None
+        self.last_thinking: str | None = None
 
     def load_model(self) -> None:
         if genai is None:
@@ -80,10 +83,31 @@ class GeminiFlashLite(VisionLanguageModel):
 
         contents = [prompt] + images
 
+        config: dict = {
+            "temperature": 0.7,
+            "thinking_config": {"thinking_budget": 10000},
+        }
+        if "response_mime_type" in kwargs:
+            config["response_mime_type"] = kwargs["response_mime_type"]
+        if "response_json_schema" in kwargs:
+            config["response_json_schema"] = kwargs["response_json_schema"]
+
         response = self._client.models.generate_content(
             model=self.MODEL_ID,
             contents=contents,
+            config=config,
         )
+        self.last_token_usage = extract_token_usage(
+            getattr(response, "usage_metadata", None)
+        )
+        thinking_parts: list[str] = []
+        try:
+            for part in response.candidates[0].content.parts:
+                if getattr(part, "thought", False) and part.text:
+                    thinking_parts.append(part.text)
+        except Exception:
+            pass
+        self.last_thinking = "\n".join(thinking_parts) if thinking_parts else None
         return response.text or ""
 
     def _generate_text_streaming(
@@ -97,9 +121,15 @@ class GeminiFlashLite(VisionLanguageModel):
 
         contents = [prompt] + images
 
+        last_chunk = None
         for chunk in self._client.models.generate_content_stream(
             model=self.MODEL_ID,
             contents=contents,
+            config={"temperature": 0.7},
         ):
+            last_chunk = chunk
             if chunk.text:
                 yield chunk.text
+        self.last_token_usage = extract_token_usage(
+            getattr(last_chunk, "usage_metadata", None) if last_chunk else None
+        )

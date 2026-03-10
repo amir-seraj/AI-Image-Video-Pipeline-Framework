@@ -91,7 +91,7 @@ class HunyuanImage3InstructNF4(ImageEditModel):
     # Fraction of GPU memory PyTorch may use.  On Jetson Thor the GPU and
     # CPU share the same 128 GB — without a cap the CUDA allocator can
     # starve the OS and trigger the OOM-killer, crashing the machine.
-    _CUDA_MEM_FRACTION = 0.90  # ~115 GB on a 128 GB Thor
+    _CUDA_MEM_FRACTION = 0.95  # ~117 GB on a 128 GB Thor
 
     def load_model(self) -> None:
         from transformers import AutoModelForCausalLM, BitsAndBytesConfig
@@ -193,6 +193,10 @@ class HunyuanImage3InstructNF4(ImageEditModel):
             "use_system_prompt": params.get("use_system_prompt", "en_unified"),
             "bot_task": params.get("bot_task", "think_recaption"),
             "diff_infer_steps": params.get("diff_infer_steps", 50),
+            # Cap max_new_tokens to limit the static KV cache size during the
+            # think/recaption stage. Default 2048 creates a ~49 GiB cache that
+            # OOMs on 128 GB Jetson when combined with the 65 GiB model.
+            "max_new_tokens": params.get("max_new_tokens", 512),
         }
 
         clamp_steps(gen_kwargs, "diff_infer_steps", self.MIN_STEPS, self.MAX_STEPS)

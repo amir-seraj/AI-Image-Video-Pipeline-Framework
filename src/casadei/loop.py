@@ -101,6 +101,7 @@ class LoopStep(Step):
     output_key: str = "image"
     history_key: str = ""
     feedback_template_var: str = "feedback"
+    stagnation_patience: int = 3
 
     def _resolved_history_key(self) -> str:
         return self.history_key or f"{self.name}_history"
@@ -162,6 +163,8 @@ class LoopStep(Step):
         # Initialize empty feedback for first iteration
         working["loop_feedback"] = TextMedia(text="")
         accepted = False
+        _best_min_score: float | None = None
+        _stagnation_streak: int = 0
 
         if not self.swap_models:
             self.load()
@@ -208,6 +211,24 @@ class LoopStep(Step):
 
                 if accepted:
                     break
+
+                # Stagnation check: exit early if best min score hasn't improved
+                all_scores = {
+                    **judge_metadata.get("sketch_scores", {}),
+                    **judge_metadata.get("spec_scores", {}),
+                }
+                if all_scores:
+                    cur_min = min(all_scores.values())
+                    if _best_min_score is None or cur_min > _best_min_score:
+                        _best_min_score = cur_min
+                        _stagnation_streak = 0
+                    else:
+                        _stagnation_streak += 1
+                    if _stagnation_streak >= self.stagnation_patience:
+                        print(f"  [Loop] Stagnation detected — min score stuck at {cur_min} "
+                              f"for {_stagnation_streak} iterations (best={_best_min_score}). "
+                              f"Exiting early.")
+                        break
 
                 # Only inject feedback for next body run if not the last iteration
                 if not is_last:

@@ -24,6 +24,7 @@ dependencies = [
     "python-multipart>=0.0.18",
     "python-dotenv>=1.0.0",
     "voyageai>=0.3.0",
+    "faiss-cpu>=1.7.0",
 ]
 
 [project.optional-dependencies]

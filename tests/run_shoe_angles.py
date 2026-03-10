@@ -36,12 +36,15 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger("shoe_angles")
 
 from dotenv import load_dotenv
 from PIL import Image as PILImage
@@ -51,6 +54,12 @@ load_dotenv()
 
 from google import genai
 from google.genai import types as genai_types
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "workflows" / "sketch_to_shoe" / "scripts"))
+
+from casadei.media import ImageMedia
+from judge import VLMSession, make_spec_judge, make_reference_fidelity_judge, make_shoe_count_judge
 
 # ---------------------------------------------------------------------------
 # Camera angle presets — same as run_sketch_to_shoe_gemini.py
@@ -195,125 +204,161 @@ CAMERA_PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "hero-front-right": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-right of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and right side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe boxes of both shoes point toward the LEFT side of the frame; "
+                "the heels recede toward the RIGHT-BACK. "
+                "The RIGHT/OUTER sides of both shoes face the camera — the left/inner sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-right of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and outer side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the LEFT side of the frame; "
+                "the heel recedes toward the RIGHT-BACK. "
+                "The OUTER/LATERAL side of the left shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-right of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and outer side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the LEFT side of the frame; "
+                "the heel recedes toward the RIGHT-BACK. "
+                "The INNER/MEDIAL (arch) side of the right shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
     "hero-front-left": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-left of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and left side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe boxes of both shoes point toward the RIGHT side of the frame; "
+                "the heels recede toward the LEFT-BACK. "
+                "The LEFT/INNER sides of both shoes face the camera — the right/outer sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-left of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and inner side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the RIGHT side of the frame; "
+                "the heel recedes toward the LEFT-BACK. "
+                "The INNER/MEDIAL (arch) side of the left shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the front-left of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The toe box and inner side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the toe box points toward the RIGHT side of the frame; "
+                "the heel recedes toward the LEFT-BACK. "
+                "The OUTER/LATERAL side of the right shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
     "hero-back-right": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-right of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel counter and right side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counters are in the LEFT-FRONT area of the frame; "
+                "the toe boxes recede toward the RIGHT-BACK. "
+                "The RIGHT/OUTER sides of both shoes face the camera — the left/inner sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-right of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and outer side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the LEFT-FRONT area of the frame; "
+                "the toe recedes toward the RIGHT-BACK. "
+                "The OUTER/LATERAL side of the left shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-right of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and outer side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the LEFT-FRONT area of the frame; "
+                "the toe recedes toward the RIGHT-BACK. "
+                "The INNER/MEDIAL (arch) side of the right shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
     "hero-back-left": {
         "pair": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-left of the shoes, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel counter and left side "
-                "of the shoes are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counters are in the RIGHT-FRONT area of the frame; "
+                "the toe boxes recede toward the LEFT-BACK. "
+                "The LEFT/INNER sides of both shoes face the camera — the right/outer sides are turned away and NOT visible."
             ),
             "staging_desc": (
-                "A pair of shoes on the white surface, filling the frame with presence."
+                "A pair of shoes on the white surface filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
             ),
         },
         "left": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-left of the left shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and inner side "
-                "of the left shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the RIGHT-FRONT area of the frame; "
+                "the toe recedes toward the LEFT-BACK. "
+                "The INNER/MEDIAL (arch) side of the left shoe faces the camera — "
+                "the outer/lateral side is turned away and NOT visible."
             ),
-            "staging_desc": "The left shoe filling the frame with presence.",
+            "staging_desc": (
+                "The left shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
         "right": {
             "camera_desc": (
-                "Dynamic hero shot: camera low at roughly 30 degrees from the ground, "
-                "positioned at the back-left of the right shoe, angled upward. "
-                "Slight Dutch tilt for editorial drama. The heel and inner side "
-                "of the right shoe are prominent."
+                "Dynamic low hero shot (~30° elevation from ground). "
+                "In the output image: the heel counter is in the RIGHT-FRONT area of the frame; "
+                "the toe recedes toward the LEFT-BACK. "
+                "The OUTER/LATERAL side of the right shoe faces the camera — "
+                "the inner/medial (arch) side is turned away and NOT visible."
             ),
-            "staging_desc": "The right shoe filling the frame with presence.",
+            "staging_desc": (
+                "The right shoe filling the frame with dramatic presence. "
+                "Slight Dutch tilt."
+            ),
         },
     },
 }
@@ -325,6 +370,33 @@ CAMERA_PRESETS["front view"] = CAMERA_PRESETS["front"]
 CAMERA_PRESETS["back view"] = CAMERA_PRESETS["back"]
 CAMERA_PRESETS["top view"] = CAMERA_PRESETS["top"]
 CAMERA_PRESETS["hero"] = CAMERA_PRESETS["hero-front-right"]
+
+MAX_JUDGE_ITERATIONS = 3
+
+_CAMERA_JUDGE_NOTES = (
+    "EVALUATE camera_angle using these steps in order:\n\n"
+    "STEP A — OBSERVE FIRST.\n"
+    "  Write your answers into observations[\"camera_angle\"] before scoring:\n"
+    "  - Which direction does the TOE BOX point in the frame? (LEFT / RIGHT / CENTER / AWAY)\n"
+    "  - Which part of the shoe is the primary subject facing the camera? "
+    "(toe box front / heel back / outer side / inner side / top)\n\n"
+    "STEP B — COMPARE to the spec.\n"
+    "  Read the spec carefully. Check ONLY what the spec explicitly states — "
+    "do not invent additional requirements that are not mentioned.\n"
+    "  Score 4-5: what you observed in Step A satisfies the spec's stated requirements.\n"
+    "  Score 3: the angle is mostly right but has a minor deviation from the spec.\n"
+    "  Score 1-2: the angle is clearly and fundamentally wrong "
+    "(e.g. spec says toe-front but heel is facing camera, or spec says left but toe points right).\n"
+    "  IMPORTANT: Be lenient with head-on front/rear/top views. "
+    "For a front view, seeing the interior (insole, straps) is normal and correct — "
+    "do NOT penalise a front view for showing the inside of the shoe. "
+    "Do NOT penalise camera height, exact elevation angle, Dutch tilt, or minor staging variations.\n\n"
+    "STEP C — REPAIR (only if score ≤ 3):\n"
+    "  State one concrete fix describing the required output state. "
+    "For angled shots: name which direction the toe must point (LEFT / RIGHT / CENTER) "
+    "and which part of the shoe should face the camera. "
+    "Do NOT write 'rotate' or 'adjust the camera' — only describe what the final image must show."
+)
 
 CANONICAL_ANGLES = [
     "3/4", "side", "front", "back", "top",
@@ -439,7 +511,10 @@ PROMPT_TEMPLATE = (
     "The result must be a studio-quality photograph: clean white background, "
     "professional product lighting, sharp focus, no shadows on background. "
     "The shoe must look identical to the reference — only the viewing angle changes."
+    "{feedback}"
 )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +528,7 @@ def generate_angle(
     angle: str,
     foot: str,
     single: bool = False,
+    feedback: str = "",
 ) -> tuple[str, PILImage.Image]:
     """Generate a single angle. Returns (angle_name, result_image)."""
     effective_foot = _foot_for_angle(angle, foot, single=single)
@@ -469,7 +545,11 @@ def generate_angle(
         camera_desc=preset["camera_desc"],
         staging_desc=preset["staging_desc"],
         foot_framing=_foot_framing(effective_foot),
+        feedback=f"\n\n{feedback}" if feedback else "",
     )
+
+    logger.info("=== generate_angle: %s (foot=%s) ===", angle, effective_foot)
+    logger.info("PROMPT:\n%s", prompt)
 
     # Pad both images to the same ratio
     ratio = _find_ratio(*reference.size)
@@ -478,10 +558,13 @@ def generate_angle(
     padded_ref = _pad_to_ratio(reference, ratio)
     target_size = padded_ref.size
 
+    logger.info("Aspect ratio: %s, target size: %s", aspect_ratio_str, target_size)
+
     response = client.models.generate_content(
         model="gemini-3.1-flash-image-preview",
         contents=[prompt, padded_sketch, padded_ref],
         config=genai_types.GenerateContentConfig(
+            temperature=1.0,
             image_config=genai_types.ImageConfig(
                 image_size="1K",
                 aspect_ratio=aspect_ratio_str,
@@ -489,9 +572,16 @@ def generate_angle(
         ),
     )
 
+    # Log any text parts from response
+    for part in response.parts:
+        if part.text:
+            logger.info("API text response for %s: %s", angle, part.text)
+
     for part in response.parts:
         if part.inline_data is not None:
-            result = PILImage.open(io.BytesIO(part.inline_data.data))
+            result = PILImage.open(io.BytesIO(bytes(part.inline_data.data)))
+            result.load()  # force full pixel load before response/buffer is GC'd
+            logger.info("Got image for %s: %sx%s", angle, result.width, result.height)
             if result.size != target_size:
                 result = result.resize(target_size, PILImage.LANCZOS)
             return angle, result
@@ -500,6 +590,186 @@ def generate_angle(
         f"No image returned by Gemini API for angle '{angle}'. "
         "The model may have refused the request or returned text only."
     )
+
+
+def _annotate_image(
+    img: PILImage.Image,
+    angle: str,
+    iteration: int,
+    angle_ok: bool,
+    ref_ok: bool,
+    count_ok: bool = True,
+) -> PILImage.Image:
+    """Return a copy of img with a small info banner at the top."""
+    from PIL import ImageDraw, ImageFont
+    out = img.copy().convert("RGB")
+    draw = ImageDraw.Draw(out)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+    except Exception:
+        font = ImageFont.load_default()
+    label = (
+        f"{angle}  iter={iteration}  "
+        f"cam={'OK' if angle_ok else 'FAIL'}  "
+        f"ref={'OK' if ref_ok else 'FAIL'}  "
+        f"count={'OK' if count_ok else 'FAIL'}"
+    )
+    banner_h = 28
+    draw.rectangle([0, 0, out.width, banner_h], fill=(30, 30, 30))
+    draw.text((6, 4), label, fill=(255, 255, 255), font=font)
+    return out
+
+
+def generate_angle_with_judge(
+    client: genai.Client,
+    sketch: PILImage.Image,
+    reference: PILImage.Image,
+    angle: str,
+    foot: str,
+    single: bool = False,
+    output_dir: Path | None = None,
+) -> tuple[str, PILImage.Image]:
+    """Generate a single angle with three parallel judges (camera angle + reference fidelity + shoe count).
+
+    All judges run concurrently per iteration. Accepted only if all three pass.
+    Combined feedback is injected into the next generation prompt.
+    """
+    effective_foot = _foot_for_angle(angle, foot, single=single)
+    key = angle.lower().strip()
+    preset = CAMERA_PRESETS.get(key, {}).get(effective_foot, {
+        "camera_desc": angle,
+        "staging_desc": "The shoe(s) placed on the white surface.",
+    })
+
+    reference_media = ImageMedia(image=reference)
+    sketch_media = ImageMedia(image=sketch)
+    session_angle = VLMSession("gemini_flash")
+    session_ref = VLMSession("gemini_flash")
+    session_count = VLMSession("gemini_flash_lite")
+
+    camera_judge = make_spec_judge(
+        session=session_angle,
+        candidate_key="image",
+        spec={"camera_angle": preset["camera_desc"] + " " + preset["staging_desc"]},
+        tolerance="generous",
+        include_quality_features=False,
+        judge_notes=_CAMERA_JUDGE_NOTES,
+    )
+    angle_safe = angle.replace("/", "_")
+    logs_dir = (output_dir / "logs") if output_dir is not None else None
+    if logs_dir is not None:
+        logs_dir.mkdir(exist_ok=True)
+    ref_judge = make_reference_fidelity_judge(
+        session=session_ref,
+        reference_image=reference_media,
+        sketch_image=sketch_media,
+        candidate_key="image",
+        tolerance="moderate",
+        save_dir=logs_dir,
+        angle_name=angle_safe,
+    )
+    count_judge = make_shoe_count_judge(
+        session=session_count,
+        foot=effective_foot,
+        candidate_key="image",
+    )
+
+    feedback = ""
+    last_img = None
+    judge_log: list[dict] = []
+    try:
+        for iteration in range(MAX_JUDGE_ITERATIONS):
+            _, img = generate_angle(client, sketch, reference, angle, foot, single, feedback)
+            last_img = img
+            image_media = ImageMedia(image=img)
+
+            # Run all three judges concurrently
+            ctx_angle: dict = {"image": image_media}
+            ctx_ref: dict = {"image": image_media}
+            ctx_count: dict = {"image": image_media}
+            with ThreadPoolExecutor(max_workers=3) as judge_pool:
+                fut_angle = judge_pool.submit(camera_judge, ctx_angle)
+                fut_ref = judge_pool.submit(ref_judge, ctx_ref)
+                fut_count = judge_pool.submit(count_judge, ctx_count)
+                angle_accepted, angle_fb = fut_angle.result()
+                ref_accepted, ref_fb = fut_ref.result()
+                count_accepted, count_fb = fut_count.result()
+
+            camera_detail = ctx_angle.pop("_judge_detail_spec", {})
+            ref_detail = ctx_ref.pop("_judge_detail_ref", {})
+            count_detail = ctx_count.pop("_judge_detail_count", {})
+
+            accepted = angle_accepted and ref_accepted and count_accepted
+            verdict = "ACCEPT" if accepted else "REJECT"
+            print(f"  [{angle}] iteration {iteration + 1}/{MAX_JUDGE_ITERATIONS}: {verdict} "
+                  f"(angle={'OK' if angle_accepted else 'FAIL'}, "
+                  f"ref={'OK' if ref_accepted else 'FAIL'}, "
+                  f"count={'OK' if count_accepted else 'FAIL'})")
+
+            judge_log.append({
+                "iteration": iteration + 1,
+                "verdict": verdict,
+                "camera_judge": {
+                    "accepted": angle_accepted,
+                    "feedback": angle_fb,
+                    **camera_detail,
+                },
+                "reference_judge": {
+                    "accepted": ref_accepted,
+                    "feedback": ref_fb,
+                    **ref_detail,
+                },
+                "count_judge": {
+                    "accepted": count_accepted,
+                    "feedback": count_fb,
+                    **count_detail,
+                },
+                "feedback_injected": "",
+            })
+
+            if logs_dir is not None:
+                try:
+                    annotated = _annotate_image(
+                        img, angle, iteration + 1, angle_accepted, ref_accepted, count_accepted
+                    )
+                    annotated.save(logs_dir / f"{angle_safe}_generated_iter{iteration + 1}.png")
+                except Exception as _e:
+                    print(f"  [{angle}] Warning: could not save annotated image: {_e}")
+
+            if accepted:
+                return angle, img
+
+            parts = []
+            if not count_accepted and count_fb and count_fb != "none":
+                parts.append(f"Shoe count/foot issue: {count_fb}")
+            if not angle_accepted and angle_fb and angle_fb != "none":
+                if ref_accepted and count_accepted:
+                    # Materials and count are fine — protect them while fixing angle
+                    parts.append(
+                        "CRITICAL: Keep ALL materials, colors, textures, and design elements "
+                        "IDENTICAL to the reference image — do NOT change any design aspect. "
+                        "Only correct the camera angle as described below."
+                    )
+                parts.append(f"Camera angle issue: {angle_fb}")
+            if not ref_accepted and ref_fb and ref_fb != "none":
+                parts.append(f"Design fidelity issue: {ref_fb}")
+            feedback = "\n".join(parts)
+            if judge_log:
+                judge_log[-1]["feedback_injected"] = feedback
+    finally:
+        session_angle.unload()
+        session_ref.unload()
+        session_count.unload()
+        if logs_dir is not None and judge_log:
+            try:
+                log_path = logs_dir / f"{angle_safe}_judge_log.json"
+                log_path.write_text(json.dumps({"angle": angle, "iterations": judge_log}, indent=2))
+            except Exception as _e:
+                print(f"  [{angle}] Warning: could not save judge log: {_e}")
+
+    # All iterations exhausted without acceptance — return last attempt.
+    return angle, last_img
+
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +822,15 @@ def main():
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set up file logging for this run
+    log_path = output_dir / "run.log"
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(file_handler)
+    logger.setLevel(logging.DEBUG)
+
     print("=== Shoe Angle Generator — Gemini ===")
     print(f"Sketch:     {args.sketch}")
     print(f"Reference:  {args.reference}")
@@ -559,7 +838,12 @@ def main():
     print(f"Angles:     {', '.join(angles)}")
     print(f"Concurrent: {len(angles) > 1}")
     print(f"Output:     {output_dir}")
+    print(f"Log:        {log_path}")
     print()
+
+    logger.info("Sketch: %s", args.sketch)
+    logger.info("Reference: %s", args.reference)
+    logger.info("Foot: %s, Single: %s", args.foot, args.single)
 
     # Save inputs for reference
     sketch.save(output_dir / "input_sketch.png")
@@ -569,42 +853,34 @@ def main():
     results: dict[str, dict] = {}
     t0 = time.perf_counter()
 
-    if len(angles) == 1:
-        # Single angle — no threading needed
-        angle = angles[0]
-        print(f"  Generating: {angle} ... ", end="", flush=True)
-        at = time.perf_counter()
-        _, img = generate_angle(
-            client, sketch, reference, angle, args.foot, single=args.single,
-        )
-        elapsed = time.perf_counter() - at
-        fname = f"{angle.replace('/', '_')}.png"
-        img.save(output_dir / fname)
-        results[angle] = {"file": fname, "elapsed_s": round(elapsed, 1)}
-        print(f"done ({elapsed:.1f}s)")
-    else:
-        # Multiple angles — fire all concurrently
-        futures = {}
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            for angle in angles:
-                fut = pool.submit(
-                    generate_angle,
-                    client, sketch, reference, angle, args.foot, args.single,
-                )
-                futures[fut] = angle
+    logger.info("Angles: %s", angles)
 
+    def _run_and_save(angle: str) -> tuple[str, PILImage.Image | None]:
+        """Generate an angle, save it, record result."""
+        at = time.perf_counter()
+        try:
+            _, img = generate_angle_with_judge(
+                client, sketch, reference, angle, args.foot,
+                single=args.single, output_dir=output_dir,
+            )
+            elapsed = time.perf_counter() - at
+            fname = f"{angle.replace('/', '_')}.png"
+            img.save(output_dir / fname)
+            results[angle] = {"file": fname, "elapsed_s": round(elapsed, 1)}
+            print(f"  {angle}: done ({elapsed:.1f}s)")
+            return angle, img
+        except Exception as e:
+            results[angle] = {"error": str(e)}
+            print(f"  {angle}: FAILED — {e}")
+            return angle, None
+
+    if len(angles) == 1:
+        _run_and_save(angles[0])
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_run_and_save, a): a for a in angles}
             for fut in as_completed(futures):
-                angle = futures[fut]
-                try:
-                    _, img = fut.result()
-                    elapsed = time.perf_counter() - t0
-                    fname = f"{angle.replace('/', '_')}.png"
-                    img.save(output_dir / fname)
-                    results[angle] = {"file": fname, "elapsed_s": round(elapsed, 1)}
-                    print(f"  {angle}: done ({elapsed:.1f}s)")
-                except Exception as e:
-                    results[angle] = {"error": str(e)}
-                    print(f"  {angle}: FAILED — {e}")
+                fut.result()
 
     total_elapsed = time.perf_counter() - t0
 
@@ -621,9 +897,14 @@ def main():
         json.dumps(summary, indent=2, default=str)
     )
 
-    print(f"\nDone. {len([r for r in results.values() if 'file' in r])}/{len(angles)} "
+    success_count = len([r for r in results.values() if 'file' in r])
+    logger.info("SUMMARY: %d/%d angles generated in %.1fs", success_count, len(angles), total_elapsed)
+    logger.info("Results: %s", json.dumps(results, indent=2, default=str))
+
+    print(f"\nDone. {success_count}/{len(angles)} "
           f"angles generated in {total_elapsed:.1f}s")
     print(f"Output: {output_dir}")
+    print(f"Log:    {log_path}")
 
 
 if __name__ == "__main__":

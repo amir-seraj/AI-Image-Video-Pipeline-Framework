@@ -34,6 +34,7 @@ class Agent:
         self.config = config
         self._model_cls = default_registry.get(config.model)
         self._model = None
+        self.token_usage_log: list[dict] = []
 
     def load(self) -> None:
         self._model = self._model_cls()
@@ -48,7 +49,15 @@ class Agent:
         if self._model is None:
             raise RuntimeError("Agent not loaded. Call load() first.")
         prepared = self._prepare_inputs(inputs, **template_kwargs)
-        return self._model.run(prepared, **self.config.params)
+        result = self._model.run(prepared, **self.config.params)
+        usage = getattr(self._model, "last_token_usage", None)
+        if usage:
+            self.token_usage_log.append({
+                "model": getattr(self._model, "MODEL_ID", self.config.model),
+                "label": self.config.name,
+                **usage,
+            })
+        return result
 
     def _prepare_inputs(self, inputs: MediaBundle, **template_kwargs: Any) -> MediaBundle:
         items = dict(inputs.items)
