@@ -59,7 +59,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "workflows" / "sketch_to_shoe" / "scripts"))
 
 from casadei.media import ImageMedia
+from casadei.providers.gemini_pricing import extract_token_usage, calculate_cost
 from judge import VLMSession, make_spec_judge, make_reference_fidelity_judge, make_shoe_count_judge
+
+_GENERATION_MODEL_ID = "gemini-3.1-flash-image-preview"
 
 # ---------------------------------------------------------------------------
 # Camera angle presets — same as run_sketch_to_shoe_gemini.py
@@ -529,7 +532,7 @@ def generate_angle(
     foot: str,
     single: bool = False,
     feedback: str = "",
-) -> tuple[str, PILImage.Image]:
+) -> tuple[str, PILImage.Image, dict]:
     """Generate a single angle. Returns (angle_name, result_image)."""
     effective_foot = _foot_for_angle(angle, foot, single=single)
     key = angle.lower().strip()
@@ -577,6 +580,9 @@ def generate_angle(
         if part.text:
             logger.info("API text response for %s: %s", angle, part.text)
 
+    gen_usage = extract_token_usage(getattr(response, "usage_metadata", None))
+    gen_usage["model"] = _GENERATION_MODEL_ID
+
     for part in response.parts:
         if part.inline_data is not None:
             result = PILImage.open(io.BytesIO(bytes(part.inline_data.data)))
@@ -584,7 +590,7 @@ def generate_angle(
             logger.info("Got image for %s: %sx%s", angle, result.width, result.height)
             if result.size != target_size:
                 result = result.resize(target_size, PILImage.LANCZOS)
-            return angle, result
+            return angle, result, gen_usage
 
     raise RuntimeError(
         f"No image returned by Gemini API for angle '{angle}'. "
@@ -628,7 +634,7 @@ def generate_angle_with_judge(
     foot: str,
     single: bool = False,
     output_dir: Path | None = None,
-) -> tuple[str, PILImage.Image]:
+) -> tuple[str, PILImage.Image, float]:
     """Generate a single angle with three parallel judges (camera angle + reference fidelity + shoe count).
 
     All judges run concurrently per iteration. Accepted only if all three pass.
@@ -677,9 +683,18 @@ def generate_angle_with_judge(
     feedback = ""
     last_img = None
     judge_log: list[dict] = []
+    total_gen_cost = 0.0
+    total_judge_cost = 0.0
     try:
         for iteration in range(MAX_JUDGE_ITERATIONS):
-            _, img = generate_angle(client, sketch, reference, angle, foot, single, feedback)
+            # Snapshot token log lengths before this iteration's judges
+            len_angle_before = len(session_angle.token_usage_log)
+            len_ref_before = len(session_ref.token_usage_log)
+            len_count_before = len(session_count.token_usage_log)
+
+            _, img, gen_usage = generate_angle(client, sketch, reference, angle, foot, single, feedback)
+            gen_cost = calculate_cost(_GENERATION_MODEL_ID, gen_usage)
+            total_gen_cost += gen_cost
             last_img = img
             image_media = ImageMedia(image=img)
 
@@ -699,6 +714,15 @@ def generate_angle_with_judge(
             ref_detail = ctx_ref.pop("_judge_detail_ref", {})
             count_detail = ctx_count.pop("_judge_detail_count", {})
 
+            # Compute judge costs from new token log entries
+            new_judge_records = (
+                session_angle.token_usage_log[len_angle_before:]
+                + session_ref.token_usage_log[len_ref_before:]
+                + session_count.token_usage_log[len_count_before:]
+            )
+            judge_cost = sum(calculate_cost(r.get("model", ""), r) for r in new_judge_records)
+            total_judge_cost += judge_cost
+
             accepted = angle_accepted and ref_accepted and count_accepted
             verdict = "ACCEPT" if accepted else "REJECT"
             print(f"  [{angle}] iteration {iteration + 1}/{MAX_JUDGE_ITERATIONS}: {verdict} "
@@ -709,6 +733,11 @@ def generate_angle_with_judge(
             judge_log.append({
                 "iteration": iteration + 1,
                 "verdict": verdict,
+                "cost": {
+                    "generation_usd": round(gen_cost, 6),
+                    "judges_usd": round(judge_cost, 6),
+                    "total_usd": round(gen_cost + judge_cost, 6),
+                },
                 "camera_judge": {
                     "accepted": angle_accepted,
                     "feedback": angle_fb,
@@ -737,7 +766,8 @@ def generate_angle_with_judge(
                     print(f"  [{angle}] Warning: could not save annotated image: {_e}")
 
             if accepted:
-                return angle, img
+                total_cost_usd = round(total_gen_cost + total_judge_cost, 6)
+                return angle, img, total_cost_usd
 
             parts = []
             if not count_accepted and count_fb and count_fb != "none":
@@ -760,15 +790,23 @@ def generate_angle_with_judge(
         session_angle.unload()
         session_ref.unload()
         session_count.unload()
+        total_cost_usd = round(total_gen_cost + total_judge_cost, 6)
         if logs_dir is not None and judge_log:
             try:
                 log_path = logs_dir / f"{angle_safe}_judge_log.json"
-                log_path.write_text(json.dumps({"angle": angle, "iterations": judge_log}, indent=2))
+                log_data = {
+                    "angle": angle,
+                    "total_cost_usd": total_cost_usd,
+                    "total_generation_cost_usd": round(total_gen_cost, 6),
+                    "total_judges_cost_usd": round(total_judge_cost, 6),
+                    "iterations": judge_log,
+                }
+                log_path.write_text(json.dumps(log_data, indent=2))
             except Exception as _e:
                 print(f"  [{angle}] Warning: could not save judge log: {_e}")
 
     # All iterations exhausted without acceptance — return last attempt.
-    return angle, last_img
+    return angle, last_img, total_cost_usd
 
 
 
@@ -859,15 +897,15 @@ def main():
         """Generate an angle, save it, record result."""
         at = time.perf_counter()
         try:
-            _, img = generate_angle_with_judge(
+            _, img, angle_cost = generate_angle_with_judge(
                 client, sketch, reference, angle, args.foot,
                 single=args.single, output_dir=output_dir,
             )
             elapsed = time.perf_counter() - at
             fname = f"{angle.replace('/', '_')}.png"
             img.save(output_dir / fname)
-            results[angle] = {"file": fname, "elapsed_s": round(elapsed, 1)}
-            print(f"  {angle}: done ({elapsed:.1f}s)")
+            results[angle] = {"file": fname, "elapsed_s": round(elapsed, 1), "cost_usd": angle_cost}
+            print(f"  {angle}: done ({elapsed:.1f}s)  cost=${angle_cost:.6f}")
             return angle, img
         except Exception as e:
             results[angle] = {"error": str(e)}
@@ -884,10 +922,16 @@ def main():
 
     total_elapsed = time.perf_counter() - t0
 
+    # Aggregate total cost across all angles
+    total_cost_usd = round(sum(
+        r.get("cost_usd", 0.0) for r in results.values() if "file" in r
+    ), 6)
+
     # Save summary
     summary = {
         "timestamp": datetime.now().isoformat(),
         "total_elapsed_s": round(total_elapsed, 1),
+        "total_cost_usd": total_cost_usd,
         "sketch": args.sketch,
         "reference": args.reference,
         "foot": args.foot,
@@ -898,11 +942,12 @@ def main():
     )
 
     success_count = len([r for r in results.values() if 'file' in r])
-    logger.info("SUMMARY: %d/%d angles generated in %.1fs", success_count, len(angles), total_elapsed)
+    logger.info("SUMMARY: %d/%d angles generated in %.1fs  cost=$%.6f",
+                success_count, len(angles), total_elapsed, total_cost_usd)
     logger.info("Results: %s", json.dumps(results, indent=2, default=str))
 
     print(f"\nDone. {success_count}/{len(angles)} "
-          f"angles generated in {total_elapsed:.1f}s")
+          f"angles generated in {total_elapsed:.1f}s  |  total cost: ${total_cost_usd:.6f}")
     print(f"Output: {output_dir}")
     print(f"Log:    {log_path}")
 

@@ -46,6 +46,15 @@ class Generation(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class HeroCandidate(BaseModel):
+    filename: str
+    iteration: int
+    accepted: bool = False
+    score: float = 0.0
+    feedback: str = ""
+    selected: bool = False
+
+
 class GeneratedResult(BaseModel):
     filename: str
     pipeline: str = ""
@@ -55,15 +64,18 @@ class GeneratedResult(BaseModel):
 
 class Variation(BaseModel):
     id: str = Field(default_factory=_new_id)
+    name: str = ""
     material: str = ""
     color: str = ""
     note: str = ""
     pipeline: str = ""
     num_outputs: int = 1
     results: list[ResultFile] = []
+    hero_candidates: list[HeroCandidate] = []
     generated_results: list[GeneratedResult] = []
     spin_frames: list[ResultFile] = []
     spin_video: str = ""
+    model_3d: str = ""
     price_tier: str = ""
     theme: str = ""
     feature: str = ""
@@ -72,9 +84,14 @@ class Variation(BaseModel):
 
 
 class UpdateVariationMetaRequest(BaseModel):
+    name: str | None = None
     price_tier: str | None = None
     theme: str | None = None
     feature: str | None = None
+
+
+class SelectHeroCandidateRequest(BaseModel):
+    filename: str
 
 
 class Product(BaseModel):
@@ -102,6 +119,13 @@ class CreateVariationRequest(BaseModel):
 
 class RegenerateVariationRequest(BaseModel):
     change_request: str = ""
+    note: str | None = None
+
+
+class PromoteToVariationRequest(BaseModel):
+    source_variation_id: str
+    filename: str
+    note: str = ""
 
 
 class Collection(BaseModel):
@@ -258,3 +282,55 @@ class SearchResponse(BaseModel):
 class IndexStats(BaseModel):
     indexed_variants: int
     cached_queries: int
+
+
+# --- Auth ---
+
+
+class UserRole(str, Enum):
+    admin = "admin"
+    designer = "designer"
+
+
+class User(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    email: str
+    name: str
+    password_hash: str
+    role: UserRole = UserRole.designer
+    created_at: str = Field(default_factory=lambda: _utcnow().isoformat())
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class CreateUserRequest(BaseModel):
+    email: str
+    name: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str
+
+
+class CostRecord(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    user_id: str
+    timestamp: str = Field(default_factory=lambda: _utcnow().isoformat())
+    operation: str
+    product_id: str = ""
+    variation_id: str = ""
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0
+    video_seconds: float = 0
+    cost_usd: float = 0.0

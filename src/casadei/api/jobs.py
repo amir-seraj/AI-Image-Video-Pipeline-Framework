@@ -14,6 +14,8 @@ class JobState:
     progress: float = 0.0
     message: str = ""
     error: str = ""
+    cancelled: bool = False
+    detail: dict | None = None
 
 
 class JobManager:
@@ -39,7 +41,8 @@ class JobManager:
             return self._jobs.get(job_id)
 
     def update_progress(
-        self, job_id: str, progress: float, message: str = ""
+        self, job_id: str, progress: float, message: str = "",
+        detail: dict | None = None,
     ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -47,6 +50,8 @@ class JobManager:
                 job.status = "running"
                 job.progress = progress
                 job.message = message
+                if detail is not None:
+                    job.detail = detail
         self._notify(job_id)
 
     def complete(self, job_id: str) -> None:
@@ -65,6 +70,24 @@ class JobManager:
                 job.status = "failed"
                 job.error = error
         self._notify(job_id)
+
+    def cancel(self, job_id: str) -> bool:
+        """Mark a job as cancelled. Worker threads should check this flag."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status not in ("pending", "running"):
+                return False
+            job.cancelled = True
+            job.status = "failed"
+            job.error = "Cancelled by user"
+        self._notify(job_id)
+        return True
+
+    def is_cancelled(self, job_id: str) -> bool:
+        """Check if a job has been cancelled. Call from worker threads."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job.cancelled if job else False
 
     def subscribe(self, job_id: str) -> threading.Event:
         event = threading.Event()
@@ -85,6 +108,11 @@ class JobManager:
                 j for j in self._jobs.values()
                 if j.status in ("pending", "running")
             ]
+
+    def list_all(self) -> list[JobState]:
+        """Return all jobs (active + completed + failed)."""
+        with self._lock:
+            return list(self._jobs.values())
 
     def _notify(self, job_id: str) -> None:
         with self._lock:

@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -463,7 +464,7 @@ def _build_extra_specs_text(extra: dict[str, str]) -> str:
 # Pipeline construction
 # ---------------------------------------------------------------------------
 
-MAX_ITERATIONS = 2
+MAX_ITERATIONS = 3
 
 _CAMERA_JUDGE_NOTES = (
     "EVALUATE camera_angle using these steps in order:\n\n"
@@ -511,7 +512,7 @@ def build_pipeline(
     vlm_session: VLMSession,
     foot: str = "pair",
     temperature: float = 1.0,
-) -> tuple[Pipeline, Agent]:
+) -> tuple[Pipeline, Agent, list[VLMSession]]:
     extra_specs_text = _build_extra_specs_text(spec.get("extra", {}))
 
     gemini_agent = Agent(AgentConfig(
@@ -539,8 +540,11 @@ def build_pipeline(
         },
     )
 
+    session_camera = VLMSession("gemini_flash")
+    session_count = VLMSession("gemini_flash_lite")
+
     camera_judge = make_spec_judge(
-        session=vlm_session,
+        session=session_camera,
         candidate_key="image",
         spec={"camera_angle": camera_preset["camera_desc"] + " " + camera_preset["staging_desc"]},
         tolerance="generous",
@@ -549,14 +553,29 @@ def build_pipeline(
     )
 
     count_judge = make_shoe_count_judge(
-        session=vlm_session,
+        session=session_count,
         foot=foot,
         candidate_key="image",
     )
 
     def _combined_judge(context):
-        count_accepted, count_fb = count_judge(context)
-        cam_accepted, cam_fb = camera_judge(context)
+        image = context.get("image")
+        # Force PIL lazy-load before threads start — prevents concurrent load() race
+        if isinstance(image, ImageMedia):
+            image.image.load()
+        ctx_cam: dict = {"image": image}
+        ctx_count: dict = {"image": image}
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_cam = pool.submit(camera_judge, ctx_cam)
+            fut_count = pool.submit(count_judge, ctx_count)
+            cam_accepted, cam_fb = fut_cam.result()
+            count_accepted, count_fb = fut_count.result()
+
+        # Propagate metadata written by judges back to main context
+        context.update({k: v for k, v in ctx_cam.items() if k.startswith("_")})
+        context.update({k: v for k, v in ctx_count.items() if k.startswith("_")})
+
         # Promote camera metadata for best_fn
         meta = context.pop("_judge_metadata_spec", {})
         context["_judge_metadata"] = {
@@ -564,11 +583,18 @@ def build_pipeline(
             "spec_scores": meta.get("scores", {}),
             "spec_avg": meta.get("avg_score"),
         }
-        accepted = count_accepted and cam_accepted
+        accepted = cam_accepted and count_accepted
         parts = []
         if not count_accepted and count_fb and count_fb != "none":
             parts.append(f"Shoe count issue: {count_fb}")
         if not cam_accepted and cam_fb and cam_fb != "none":
+            if count_accepted:
+                # Count is fine — protect materials while fixing angle
+                parts.append(
+                    "CRITICAL: Keep ALL materials, colors, textures, and design elements "
+                    "IDENTICAL to the current image — do NOT change any design aspect. "
+                    "Only correct the camera angle as described below."
+                )
             parts.append(f"Camera angle issue: {cam_fb}")
         return accepted, "\n".join(parts) if parts else "none"
 
@@ -586,7 +612,7 @@ def build_pipeline(
         feedback_template_var="feedback",
     )
 
-    return Pipeline(name="sketch_to_shoe_gemini_direct", steps=[loop]), gemini_agent
+    return Pipeline(name="sketch_to_shoe_gemini_direct", steps=[loop]), gemini_agent, [session_camera, session_count]
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +806,7 @@ def main():
     vlm_session = VLMSession("gemini_flash")
     sketch_media = ImageMedia(image=sketch_grid)
 
-    pipeline, edit_agent = build_pipeline(
+    pipeline, edit_agent, judge_sessions = build_pipeline(
         spec=spec,
         vlm_session=vlm_session,
         foot=args.foot,
@@ -798,6 +824,8 @@ def main():
         result, exec_log = logged.run(context)
     finally:
         vlm_session.unload()
+        for s in judge_sessions:
+            s.unload()
     total_elapsed = time.perf_counter() - t0
 
     print(exec_log.summary())
@@ -805,6 +833,8 @@ def main():
     loop_result = result.get("angle_correction_loop_history")
     result_image = result.get("image")
     token_records = vlm_session.token_usage_log + edit_agent.token_usage_log
+    for s in judge_sessions:
+        token_records += s.token_usage_log
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = OUTPUT_DIR / ts

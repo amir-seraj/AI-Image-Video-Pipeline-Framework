@@ -68,6 +68,44 @@ def calculate_cost(model_id: str, usage: dict[str, int]) -> float:
     )
 
 
+# Veo pricing — USD per second of video
+VEO_PRICING: dict[str, dict[str, float]] = {
+    "veo-3.1-fast-generate-preview": {
+        "720p": 0.15,
+        "1080p": 0.15,
+        "4k": 0.35,
+    },
+    "veo-3.1-generate-preview": {
+        "720p": 0.40,
+        "1080p": 0.40,
+        "4k": 0.60,
+    },
+}
+
+# Voyage pricing — USD per token
+VOYAGE_PRICING: dict[str, float] = {
+    "voyage-multimodal-3": 0.12 / 1_000_000,
+    "voyage-multimodal-3.5": 0.12 / 1_000_000,
+    "voyage-3-large": 0.18 / 1_000_000,
+    "voyage-code-3": 0.18 / 1_000_000,
+}
+
+
+def calculate_veo_cost(model_id: str, resolution: str, seconds: float) -> float:
+    """Return estimated USD cost for a Veo video generation."""
+    pricing = VEO_PRICING.get(model_id)
+    if not pricing:
+        return 0.0
+    rate = pricing.get(resolution, pricing.get("1080p", 0))
+    return seconds * rate
+
+
+def calculate_voyage_cost(model_id: str, total_tokens: int) -> float:
+    """Return estimated USD cost for a Voyage embedding call."""
+    rate = VOYAGE_PRICING.get(model_id, 0)
+    return total_tokens * rate
+
+
 def calculate_cost_for_log(model_id: str, records: list[dict]) -> float:
     """Sum cost across a list of token-usage records for a given model."""
     return sum(calculate_cost(model_id, r) for r in records)

@@ -13,6 +13,7 @@ from casadei.providers.zero123pp import Zero123PlusPlus
 from casadei.providers.sv3d import SV3D
 from casadei.providers.gemini_flash_multiview import GeminiFlashMultiView
 from casadei.providers.veo_video_generate import VeoVideoGenerate
+from casadei.providers.hunyuan3d import Hunyuan3DProvider
 
 __all__ = [
     "QwenImageEdit",
@@ -26,4 +27,5 @@ __all__ = [
     "SV3D",
     "GeminiFlashMultiView",
     "VeoVideoGenerate",
+    "Hunyuan3DProvider",
 ]

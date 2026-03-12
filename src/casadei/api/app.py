@@ -13,7 +13,7 @@ import logging
 
 import fastapi
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
@@ -42,8 +42,10 @@ from .models import (
     PipelineUpdateRequest,
     Product,
     RefineRequest,
+    PromoteToVariationRequest,
     RegenerateVariationRequest,
     GeneratedResult,
+    HeroCandidate,
     ResultFile,
     RunResponse,
     SearchRequest,
@@ -51,9 +53,19 @@ from .models import (
     SearchResult,
     Sketch,
     UpdateCollectionRequest,
+    SelectHeroCandidateRequest,
     UpdateVariationMetaRequest,
+    User,
+    UserRole,
+    LoginRequest,
+    CreateUserRequest,
+    ChangePasswordRequest,
+    CostRecord,
+    ResetPasswordRequest,
     Variation,
 )
+from .auth import hash_password, verify_password, create_token, decode_token
+from casadei.providers.gemini_pricing import calculate_cost, extract_token_usage, calculate_veo_cost, calculate_voyage_cost
 from .store import JsonStore
 from .vectordb import VariantVectorDB, build_variant_text, normalize_text
 
@@ -67,6 +79,7 @@ def create_app(
     agents_dir: Path | None = None,
     embedding_provider: object | None = None,
 ) -> FastAPI:
+    load_dotenv()
     app = FastAPI(title="Casadei API", version="0.1.0")
 
     app.add_middleware(
@@ -98,34 +111,200 @@ def create_app(
         workflows_dir = project_root / "workflows"
     workflows_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Bootstrap admin user from env vars ---
+    logger = logging.getLogger(__name__)
+    _admin_email = os.environ.get("ADMIN_EMAIL")
+    _admin_password = os.environ.get("ADMIN_PASSWORD")
+    if _admin_email and _admin_password:
+        existing_admin = store.get_user_by_email(_admin_email)
+        if not existing_admin:
+            admin_user = User(
+                email=_admin_email,
+                name="Admin",
+                password_hash=hash_password(_admin_password),
+                role=UserRole.admin,
+            )
+            store.save_user(admin_user)
+            logger.info("Admin user created: %s", _admin_email)
+        else:
+            logger.info("Admin user already exists: %s", _admin_email)
+
+    # --- Auth helpers ---
+
+    def _get_current_user(request: Request) -> User:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing token")
+        token = auth_header[7:]
+        payload = decode_token(token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user = store.get_user(payload["sub"])
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+
+    def _require_admin(request: Request) -> User:
+        user = _get_current_user(request)
+        if user.role != UserRole.admin:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        return user
+
+    # --- Auth endpoints ---
+
+    @app.post("/api/auth/login")
+    def auth_login(req: LoginRequest):
+        user = store.get_user_by_email(req.email)
+        if not user or not verify_password(req.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = create_token(user.id, user.role.value)
+        return {
+            "token": token,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "name": user.name,
+                "role": user.role.value,
+                "created_at": user.created_at,
+            },
+        }
+
+    @app.get("/api/auth/me")
+    def auth_me(request: Request):
+        user = _get_current_user(request)
+        return {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "role": user.role.value,
+            "created_at": user.created_at,
+        }
+
+    @app.put("/api/auth/change-password")
+    def auth_change_password(req: ChangePasswordRequest, request: Request):
+        user = _get_current_user(request)
+        if not verify_password(req.current_password, user.password_hash):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        user.password_hash = hash_password(req.new_password)
+        store.save_user(user)
+        return {"ok": True}
+
+    # --- Admin user management ---
+
+    @app.get("/api/admin/users")
+    def admin_list_users(request: Request):
+        _require_admin(request)
+        users = store.list_users()
+        return [
+            {
+                "id": u.id,
+                "email": u.email,
+                "name": u.name,
+                "role": u.role.value,
+                "created_at": u.created_at,
+            }
+            for u in users
+        ]
+
+    @app.post("/api/admin/users", status_code=201)
+    def admin_create_user(req: CreateUserRequest, request: Request):
+        _require_admin(request)
+        if store.get_user_by_email(req.email):
+            raise HTTPException(status_code=409, detail="Email already exists")
+        user = User(
+            email=req.email,
+            name=req.name,
+            password_hash=hash_password(req.password),
+            role=UserRole.designer,
+        )
+        store.save_user(user)
+        return {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "role": user.role.value,
+            "created_at": user.created_at,
+        }
+
+    @app.delete("/api/admin/users/{user_id}", status_code=204)
+    def admin_delete_user(user_id: str, request: Request):
+        admin = _require_admin(request)
+        if user_id == admin.id:
+            raise HTTPException(status_code=400, detail="Cannot delete yourself")
+        if not store.delete_user(user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+
+    @app.put("/api/admin/users/{user_id}/reset-password")
+    def admin_reset_password(user_id: str, req: ResetPasswordRequest, request: Request):
+        _require_admin(request)
+        user = store.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user.password_hash = hash_password(req.new_password)
+        store.save_user(user)
+        return {"ok": True}
+
+    # --- Cost logging ---
+
+    def _log_cost(
+        user_id: str,
+        operation: str,
+        model: str,
+        product_id: str = "",
+        variation_id: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        thinking_tokens: int = 0,
+        video_seconds: float = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        record = CostRecord(
+            user_id=user_id,
+            operation=operation,
+            model=model,
+            product_id=product_id,
+            variation_id=variation_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            thinking_tokens=thinking_tokens,
+            video_seconds=video_seconds,
+            cost_usd=cost_usd,
+        )
+        store.append_cost(record)
+
     # --- Product CRUD ---
 
     @app.post("/api/products", status_code=201)
-    def create_product(req: CreateProductRequest) -> Product:
+    def create_product(req: CreateProductRequest, request: Request) -> Product:
+        _get_current_user(request)
         product = Product(name=req.name)
         store.save_product(product)
         return product
 
     @app.get("/api/products")
-    def list_products_endpoint() -> list[Product]:
+    def list_products_endpoint(request: Request) -> list[Product]:
+        _get_current_user(request)
         return store.list_products()
 
     @app.get("/api/products/{product_id}")
-    def get_product(product_id: str) -> Product:
+    def get_product(product_id: str, request: Request) -> Product:
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
         return product
 
     @app.delete("/api/products/{product_id}", status_code=204)
-    def delete_product(product_id: str) -> None:
+    def delete_product(product_id: str, request: Request) -> None:
+        _get_current_user(request)
         if not store.delete_product(product_id):
             raise HTTPException(status_code=404, detail="Product not found")
 
     # --- Sketch upload ---
 
     @app.post("/api/products/{product_id}/sketches", status_code=201)
-    async def upload_sketch(product_id: str, file: UploadFile) -> Sketch:
+    async def upload_sketch(product_id: str, file: UploadFile, request: Request) -> Sketch:
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -143,7 +322,8 @@ def create_app(
     @app.delete(
         "/api/products/{product_id}/sketches/{sketch_id}", status_code=204
     )
-    def delete_sketch(product_id: str, sketch_id: str) -> None:
+    def delete_sketch(product_id: str, sketch_id: str, request: Request) -> None:
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -185,7 +365,7 @@ def create_app(
         "DESCRIPTION: Your description here"
     )
 
-    def _run_analysis(product: Product, job_id: str) -> None:
+    def _run_analysis(product: Product, job_id: str, user_id: str = "") -> None:
         """Background thread: runs VLM analysis on product sketches."""
         try:
             import torch
@@ -265,7 +445,8 @@ def create_app(
             job_manager.fail(job_id, str(e))
 
     @app.post("/api/products/{product_id}/analyze", status_code=202)
-    def analyze_product(product_id: str) -> dict:
+    def analyze_product(product_id: str, request: Request) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -278,7 +459,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_analysis,
-            args=(product, job_id),
+            args=(product, job_id, user.id),
             daemon=True,
         )
         thread.start()
@@ -288,7 +469,8 @@ def create_app(
     # --- Agent & Pipeline info ---
 
     @app.get("/api/agents")
-    def list_agents() -> list[AgentInfo]:
+    def list_agents(request: Request) -> list[AgentInfo]:
+        _get_current_user(request)
         from casadei import load_agent
 
         result = []
@@ -309,7 +491,8 @@ def create_app(
         return result
 
     @app.get("/api/agents/{agent_name}")
-    def get_agent(agent_name: str) -> AgentConfigResponse:
+    def get_agent(agent_name: str, request: Request) -> AgentConfigResponse:
+        _get_current_user(request)
         from casadei import load_agent
 
         for yaml_file in agents_dir.glob("*.yaml"):
@@ -328,7 +511,8 @@ def create_app(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     @app.post("/api/agents", status_code=201)
-    def create_agent(req: AgentConfigRequest) -> AgentConfigResponse:
+    def create_agent(req: AgentConfigRequest, request: Request) -> AgentConfigResponse:
+        _get_current_user(request)
         from casadei.agent import AgentConfig, save_agent
 
         dest = agents_dir / f"{req.name}.yaml"
@@ -357,7 +541,8 @@ def create_app(
         )
 
     @app.put("/api/agents/{agent_name}")
-    def update_agent(agent_name: str, req: AgentConfigRequest) -> AgentConfigResponse:
+    def update_agent(agent_name: str, req: AgentConfigRequest, request: Request) -> AgentConfigResponse:
+        _get_current_user(request)
         from casadei.agent import AgentConfig, save_agent, load_agent
 
         found_path = None
@@ -397,7 +582,8 @@ def create_app(
         )
 
     @app.delete("/api/agents/{agent_name}", status_code=204)
-    def delete_agent(agent_name: str) -> None:
+    def delete_agent(agent_name: str, request: Request) -> None:
+        _get_current_user(request)
         from casadei import load_agent
 
         for yaml_file in agents_dir.glob("*.yaml"):
@@ -408,7 +594,8 @@ def create_app(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     @app.post("/api/agents/{agent_name}/duplicate", status_code=201)
-    def duplicate_agent(agent_name: str, req: DuplicateAgentRequest) -> AgentConfigResponse:
+    def duplicate_agent(agent_name: str, req: DuplicateAgentRequest, request: Request) -> AgentConfigResponse:
+        _get_current_user(request)
         from casadei.agent import AgentConfig, save_agent, load_agent
 
         dest = agents_dir / f"{req.new_name}.yaml"
@@ -447,7 +634,8 @@ def create_app(
         )
 
     @app.get("/api/models")
-    def list_models() -> list[dict]:
+    def list_models(request: Request) -> list[dict]:
+        _get_current_user(request)
         from casadei.models.registry import default_registry
         result = []
         for name in default_registry.list_models():
@@ -456,8 +644,7 @@ def create_app(
             result.append({"name": name, "default_params": all_params})
         return result
 
-    @app.get("/api/pipelines")
-    def list_pipelines() -> list[PipelinePreset]:
+    def _list_pipelines() -> list[PipelinePreset]:
         from casadei import load_agent as _load_agent
 
         results = []
@@ -504,8 +691,12 @@ def create_app(
             ))
         return results
 
-    @app.get("/api/pipelines/{pipeline_id}")
-    def get_pipeline(pipeline_id: str) -> PipelineDetailResponse:
+    @app.get("/api/pipelines")
+    def list_pipelines(request: Request) -> list[PipelinePreset]:
+        _get_current_user(request)
+        return _list_pipelines()
+
+    def _get_pipeline(pipeline_id: str) -> PipelineDetailResponse:
         from casadei import load_agent
 
         pipeline_dir = workflows_dir / pipeline_id
@@ -569,8 +760,14 @@ def create_app(
             inputs=pipeline_inputs,
         )
 
+    @app.get("/api/pipelines/{pipeline_id}")
+    def get_pipeline(pipeline_id: str, request: Request) -> PipelineDetailResponse:
+        _get_current_user(request)
+        return _get_pipeline(pipeline_id)
+
     @app.post("/api/pipelines", status_code=201)
-    def create_pipeline(req: PipelineCreateRequest) -> PipelineDetailResponse:
+    def create_pipeline(req: PipelineCreateRequest, request: Request) -> PipelineDetailResponse:
+        _get_current_user(request)
         pipeline_dir = workflows_dir / req.id
         if pipeline_dir.exists():
             raise HTTPException(status_code=409, detail="Pipeline already exists")
@@ -586,10 +783,11 @@ def create_app(
         with open(pipeline_dir / "pipeline.yaml", "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
-        return get_pipeline(req.id)
+        return _get_pipeline(req.id)
 
     @app.put("/api/pipelines/{pipeline_id}")
-    def update_pipeline(pipeline_id: str, req: PipelineUpdateRequest) -> PipelineDetailResponse:
+    def update_pipeline(pipeline_id: str, req: PipelineUpdateRequest, request: Request) -> PipelineDetailResponse:
+        _get_current_user(request)
         pipeline_dir = workflows_dir / pipeline_id
         pipeline_yaml = pipeline_dir / "pipeline.yaml"
         if not pipeline_yaml.exists():
@@ -608,10 +806,11 @@ def create_app(
         with open(pipeline_yaml, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
-        return get_pipeline(pipeline_id)
+        return _get_pipeline(pipeline_id)
 
     @app.delete("/api/pipelines/{pipeline_id}", status_code=204)
-    def delete_pipeline(pipeline_id: str) -> None:
+    def delete_pipeline(pipeline_id: str, request: Request) -> None:
+        _get_current_user(request)
         import shutil
         pipeline_dir = workflows_dir / pipeline_id
         if not pipeline_dir.exists():
@@ -620,8 +819,9 @@ def create_app(
 
     @app.post("/api/pipelines/{pipeline_id}/agents", status_code=201)
     def create_pipeline_local_agent(
-        pipeline_id: str, req: AgentConfigRequest
+        pipeline_id: str, req: AgentConfigRequest, request: Request,
     ) -> AgentConfigResponse:
+        _get_current_user(request)
         from casadei.agent import AgentConfig, save_agent
 
         pipeline_dir = workflows_dir / pipeline_id
@@ -653,7 +853,8 @@ def create_app(
         )
 
     @app.delete("/api/pipelines/{pipeline_id}/agents/{agent_name}", status_code=204)
-    def delete_pipeline_local_agent(pipeline_id: str, agent_name: str) -> None:
+    def delete_pipeline_local_agent(pipeline_id: str, agent_name: str, request: Request) -> None:
+        _get_current_user(request)
         pipeline_dir = workflows_dir / pipeline_id
         local_yaml = pipeline_dir / "agents" / f"{agent_name}.yaml"
         if not local_yaml.exists():
@@ -661,7 +862,8 @@ def create_app(
         local_yaml.unlink()
 
     @app.post("/api/pipelines/{pipeline_id}/scripts/{filename}/open", status_code=200)
-    def open_pipeline_script(pipeline_id: str, filename: str) -> dict:
+    def open_pipeline_script(pipeline_id: str, filename: str, request: Request) -> dict:
+        _get_current_user(request)
         import subprocess
         pipeline_dir = workflows_dir / pipeline_id
         scripts_dir = pipeline_dir / "scripts"
@@ -706,6 +908,7 @@ def create_app(
         template_variables: dict[str, str],
         named_images: dict[str, Path],
         job_id: str,
+        user_id: str = "",
     ) -> None:
         """Background thread: runs a single agent or pipeline on scratch images.
 
@@ -854,7 +1057,9 @@ def create_app(
         image: UploadFile | None = fastapi.File(None),
         images: list[UploadFile] = fastapi.File([]),
         image_keys: str = fastapi.Form("[]"),
+        request: Request = None,
     ) -> RunResponse:
+        user = _get_current_user(request)
         if type not in ("agent", "pipeline"):
             raise HTTPException(status_code=400, detail="type must be 'agent' or 'pipeline'")
 
@@ -897,7 +1102,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_scratch,
-            args=(run_id, type, name, vars_dict, named_images, job_id),
+            args=(run_id, type, name, vars_dict, named_images, job_id, user.id),
             daemon=True,
         )
         thread.start()
@@ -910,6 +1115,7 @@ def create_app(
         product: Product,
         generation: Generation,
         job_id: str,
+        user_id: str = "",
     ) -> None:
         """Background thread: runs the Casadei pipeline."""
         try:
@@ -930,7 +1136,7 @@ def create_app(
                     agent_name_to_yaml[config.name] = yaml_file
 
             preset = None
-            for p in list_pipelines():
+            for p in _list_pipelines():
                 if p.id == generation.pipeline:
                     preset = p
                     break
@@ -1035,7 +1241,8 @@ def create_app(
             job_manager.fail(job_id, str(e))
 
     @app.post("/api/products/{product_id}/generate", status_code=202)
-    def start_generation(product_id: str, req: GenerateRequest) -> dict:
+    def start_generation(product_id: str, req: GenerateRequest, request: Request) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -1058,7 +1265,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_generation,
-            args=(product, generation, job_id),
+            args=(product, generation, job_id, user.id),
             daemon=True,
         )
         thread.start()
@@ -1066,7 +1273,8 @@ def create_app(
         return {"job_id": job_id, "generation_id": generation.id}
 
     @app.get("/api/jobs/active")
-    def list_active_jobs() -> list[dict]:
+    def list_active_jobs(request: Request) -> list[dict]:
+        _get_current_user(request)
         return [
             {
                 "job_id": j.job_id,
@@ -1079,8 +1287,35 @@ def create_app(
             for j in job_manager.list_active()
         ]
 
+    @app.get("/api/jobs/all")
+    def list_all_jobs(request: Request) -> list[dict]:
+        _get_current_user(request)
+        jobs = job_manager.list_all()
+        return [
+            {
+                "job_id": j.job_id,
+                "product_id": j.product_id,
+                "generation_id": j.generation_id,
+                "status": j.status,
+                "progress": j.progress,
+                "message": j.message,
+                "error": j.error,
+                "detail": j.detail,
+            }
+            for j in jobs
+        ]
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str, request: Request) -> dict:
+        _get_current_user(request)
+        success = job_manager.cancel(job_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Job not found or already finished")
+        return {"status": "cancelled"}
+
     @app.get("/api/jobs/{job_id}")
-    def get_job(job_id: str) -> dict:
+    def get_job(job_id: str, request: Request) -> dict:
+        _get_current_user(request)
         state = job_manager.get(job_id)
         if not state:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -1115,6 +1350,7 @@ def create_app(
                                 "progress": current.progress,
                                 "message": current.message,
                                 "error": current.error,
+                                "detail": current.detail,
                             }
                         ),
                     }
@@ -1133,7 +1369,8 @@ def create_app(
     # --- Refine ---
 
     @app.post("/api/generations/{generation_id}/refine", status_code=202)
-    def refine_generation(generation_id: str, req: RefineRequest) -> dict:
+    def refine_generation(generation_id: str, req: RefineRequest, request: Request) -> dict:
+        user = _get_current_user(request)
         for product in store.list_products():
             for gen in product.generations:
                 if gen.id == generation_id:
@@ -1151,7 +1388,7 @@ def create_app(
                     job_id = job_manager.create(product.id, new_gen.id)
                     thread = threading.Thread(
                         target=_run_generation,
-                        args=(product, new_gen, job_id),
+                        args=(product, new_gen, job_id, user.id),
                         daemon=True,
                     )
                     thread.start()
@@ -1165,11 +1402,12 @@ def create_app(
         variation: Variation,
         job_id: str,
         change_request: str = "",
+        user_id: str = "",
     ) -> None:
         """Background thread: generates images for a variation."""
         if variation.pipeline == "sketch_to_shoe_gemini":
             return _run_variation_gemini(
-                product, variation, job_id, change_request
+                product, variation, job_id, change_request, user_id
             )
         try:
             from casadei import (
@@ -1189,7 +1427,7 @@ def create_app(
                     agent_name_to_yaml[config.name] = yaml_file
 
             preset = None
-            for p in list_pipelines():
+            for p in _list_pipelines():
                 if p.id == variation.pipeline:
                     preset = p
                     break
@@ -1302,6 +1540,7 @@ def create_app(
         variation: Variation,
         job_id: str,
         change_request: str = "",
+        user_id: str = "",
     ) -> None:
         """Background thread: Gemini sketch-to-shoe direct generation with camera angle judge."""
         try:
@@ -1337,15 +1576,21 @@ def create_app(
             sketch_media = ImageMedia(image=sketch_grid)
 
             # Build material spec from variation fields
+            # Frontend may send a single prompt in note, or separate material/color fields
             material_parts = []
             if variation.color:
                 material_parts.append(variation.color)
             if variation.material:
                 material_parts.append(variation.material)
-            material_str = " ".join(material_parts) if material_parts else "black patent leather"
+            if variation.note and not material_parts:
+                # Single-prompt mode: note IS the full description
+                material_str = variation.note
+            else:
+                material_str = " ".join(material_parts) if material_parts else "black patent leather"
 
             extra_spec: dict[str, str] = {}
-            if variation.note:
+            if variation.note and material_parts:
+                # Only pass note as extra if material/color are also present
                 extra_spec["note"] = variation.note
             if change_request:
                 extra_spec["change_request"] = change_request
@@ -1356,62 +1601,128 @@ def create_app(
                 "extra": extra_spec,
             }
 
-            job_manager.update_progress(job_id, 0.1, "Generating shoe image...")
+            NUM_HERO_CANDIDATES = 2
 
-            vlm_session = VLMSession("gemini_flash_lite")
-
-            try:
-                pipeline, edit_agent = build_pipeline(
-                    spec=spec,
-                    vlm_session=vlm_session,
-                    foot="pair",
-                    temperature=0.8,
-                )
-                logged = LoggedPipeline(pipeline)
-
-                context = {
-                    "sketch": sketch_media,
-                    "image": sketch_media,
-                }
-
-                # Progress monitor thread
-                def _progress_monitor():
-                    step = 0
-                    while not _progress_done.is_set():
-                        step += 1
-                        pct = min(0.1 + step * 0.25, 0.85)
-                        job_manager.update_progress(
-                            job_id, pct,
-                            f"Iteration {step} — generating & checking angle..."
-                        )
-                        _progress_done.wait(timeout=20)
-
-                _progress_done = threading.Event()
-                monitor = threading.Thread(target=_progress_monitor, daemon=True)
-                monitor.start()
-
-                try:
-                    result, exec_log = logged.run(context)
-                finally:
-                    _progress_done.set()
-                    monitor.join(timeout=5)
-
-            finally:
-                vlm_session.unload()
-
-            final_img = result.get("image")
-            if final_img is None or not isinstance(final_img, ImageMedia):
-                job_manager.fail(job_id, "Generation loop produced no output image")
-                return
-
-            job_manager.update_progress(job_id, 0.9, "Saving hero image...")
+            job_manager.update_progress(job_id, 0.05, "Generating hero candidates...")
 
             var_results_dir = results_dir / product.id / variation.id
             var_results_dir.mkdir(parents=True, exist_ok=True)
 
-            fname = "hero.png"
-            final_img.image.save(var_results_dir / fname)
-            variation.results = [ResultFile(filename=fname)]
+            from casadei.loop import LoopResult as _LoopResult
+            candidates: list[HeroCandidate] = []
+            best_score = -1.0
+            best_candidate_idx = 0
+
+            for run_idx in range(NUM_HERO_CANDIDATES):
+                pct_base = 0.05 + run_idx * (0.85 / NUM_HERO_CANDIDATES)
+                pct_end = 0.05 + (run_idx + 1) * (0.85 / NUM_HERO_CANDIDATES)
+                job_manager.update_progress(
+                    job_id, pct_base,
+                    f"Generating candidate {run_idx + 1}/{NUM_HERO_CANDIDATES}..."
+                )
+
+                vlm_session = VLMSession("gemini_flash_lite")
+                try:
+                    pipeline, edit_agent, _vlm_sessions = build_pipeline(
+                        spec=spec,
+                        vlm_session=vlm_session,
+                        foot="pair",
+                        temperature=0.8,
+                    )
+                    logged = LoggedPipeline(pipeline)
+                    context = {
+                        "sketch": sketch_media,
+                        "image": sketch_media,
+                    }
+
+                    # Progress monitor for this run
+                    _progress_done = threading.Event()
+                    def _make_monitor(base=pct_base, end=pct_end, done=_progress_done):
+                        def _monitor():
+                            step = 0
+                            while not done.is_set():
+                                step += 1
+                                pct = min(base + step * 0.08, end - 0.02)
+                                job_manager.update_progress(
+                                    job_id, pct,
+                                    f"Candidate {run_idx + 1}/{NUM_HERO_CANDIDATES} — iteration {step}..."
+                                )
+                                done.wait(timeout=20)
+                        return _monitor
+
+                    monitor = threading.Thread(target=_make_monitor(), daemon=True)
+                    monitor.start()
+
+                    try:
+                        result, exec_log = logged.run(context)
+                    finally:
+                        _progress_done.set()
+                        monitor.join(timeout=5)
+
+                finally:
+                    vlm_session.unload()
+
+                # Log costs
+                if hasattr(edit_agent, "token_usage_log"):
+                    for usage_entry in edit_agent.token_usage_log:
+                        cost = calculate_cost(usage_entry.get("model", ""), usage_entry)
+                        _log_cost(user_id=user_id, operation="variation", model=usage_entry.get("model", ""),
+                                  product_id=product.id, variation_id=variation.id,
+                                  input_tokens=usage_entry.get("input_tokens", 0),
+                                  output_tokens=usage_entry.get("output_tokens", 0),
+                                  thinking_tokens=usage_entry.get("thinking_tokens", 0), cost_usd=cost)
+
+                # Extract the final image from this run
+                run_img = result.get("image")
+                if run_img is None or not isinstance(run_img, ImageMedia):
+                    continue
+
+                # Extract score from the loop history
+                score = 0.0
+                accepted = False
+                feedback = ""
+                loop_history = result.get("angle_correction_loop_history")
+                if isinstance(loop_history, _LoopResult) and loop_history.iterations:
+                    # Use the last iteration's metadata (the accepted/best one)
+                    last_it = loop_history.iterations[-1]
+                    spec_avg = last_it.metadata.get("spec_avg") or 0.0
+                    sketch_avg = last_it.metadata.get("sketch_avg") or 0.0
+                    score = (spec_avg + sketch_avg) / 2.0 if (spec_avg or sketch_avg) else 0.0
+                    accepted = last_it.accepted
+                    feedback = last_it.feedback[:200]
+
+                # Save candidate
+                c_fname = f"hero_candidate_{run_idx}.png"
+                run_img.image.save(var_results_dir / c_fname)
+                candidates.append(HeroCandidate(
+                    filename=c_fname,
+                    iteration=run_idx,
+                    accepted=accepted,
+                    score=round(score, 3),
+                    feedback=feedback,
+                    selected=False,
+                ))
+
+                if score > best_score:
+                    best_score = score
+                    best_candidate_idx = len(candidates) - 1
+
+            if not candidates:
+                job_manager.fail(job_id, "All generation runs produced no output")
+                return
+
+            # Mark the best candidate
+            candidates[best_candidate_idx].selected = True
+
+            job_manager.update_progress(job_id, 0.92, "Saving hero image...")
+
+            # Copy best candidate as hero.png
+            import shutil
+            best_fname = candidates[best_candidate_idx].filename
+            shutil.copy2(var_results_dir / best_fname, var_results_dir / "hero.png")
+
+            variation.results = [ResultFile(filename="hero.png")]
+            variation.hero_candidates = candidates
             variation.status = JobStatus.completed
             store.save_product(product)
 
@@ -1424,8 +1735,9 @@ def create_app(
 
     @app.post("/api/products/{product_id}/variations", status_code=202)
     def create_variation(
-        product_id: str, req: CreateVariationRequest,
+        product_id: str, req: CreateVariationRequest, request: Request,
     ) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -1449,12 +1761,59 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_variation,
-            args=(product, variation, job_id),
+            args=(product, variation, job_id, "", user.id),
             daemon=True,
         )
         thread.start()
 
         return {"job_id": job_id, "variation_id": variation.id}
+
+    @app.post(
+        "/api/products/{product_id}/variations/from-result",
+        status_code=201,
+    )
+    def promote_to_variation(
+        product_id: str, req: PromoteToVariationRequest, request: Request,
+    ) -> dict:
+        """Create a new variation by copying an existing generated result as its hero."""
+        _get_current_user(request)
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Find source variation
+        source_var = None
+        for v in product.variations:
+            if v.id == req.source_variation_id:
+                source_var = v
+                break
+        if not source_var:
+            raise HTTPException(status_code=404, detail="Source variation not found")
+
+        # Find the source file
+        source_path = results_dir / product_id / source_var.id / req.filename
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail="Source image not found")
+
+        # Create new variation
+        new_variation = Variation(
+            note=req.note or source_var.note,
+            pipeline=source_var.pipeline,
+            status=JobStatus.completed,
+        )
+
+        # Copy the image as hero.png
+        new_results_dir = results_dir / product_id / new_variation.id
+        new_results_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+        dest = new_results_dir / "hero.png"
+        shutil.copy2(source_path, dest)
+
+        new_variation.results = [ResultFile(filename="hero.png")]
+        product.variations.append(new_variation)
+        store.save_product(product)
+
+        return {"variation_id": new_variation.id}
 
     @app.post(
         "/api/products/{product_id}/variations/{variation_id}/regenerate",
@@ -1464,7 +1823,9 @@ def create_app(
         product_id: str,
         variation_id: str,
         req: RegenerateVariationRequest,
+        request: Request,
     ) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -1481,13 +1842,17 @@ def create_app(
 
         variation.status = JobStatus.pending
         variation.results = []
+        if req.note is not None:
+            variation.note = req.note
+            variation.material = ""
+            variation.color = ""
         store.save_product(product)
 
         job_id = job_manager.create(product_id, variation.id)
 
         thread = threading.Thread(
             target=_run_variation,
-            args=(product, variation, job_id, req.change_request),
+            args=(product, variation, job_id, req.change_request, user.id),
             daemon=True,
         )
         thread.start()
@@ -1503,6 +1868,7 @@ def create_app(
         foot: str = "right",
         single: bool = False,
         selected_angles: list[str] | None = None,
+        user_id: str = "",
     ) -> None:
         """Background thread: generates all camera angles from the hero image."""
         try:
@@ -1563,7 +1929,9 @@ def create_app(
 
             def _gen_angle(angle: str) -> tuple[str, PILImage.Image | None]:
                 try:
-                    _, img = generate_angle(client, sketch, reference, angle, foot, single=single)
+                    if job_manager.is_cancelled(job_id):
+                        return angle, None
+                    _, img, _usage = generate_angle(client, sketch, reference, angle, foot, single=single)
                     return angle, img
                 except Exception:
                     return angle, None
@@ -1577,11 +1945,16 @@ def create_app(
                         generated_images[angle] = img
                         fname = f"{angle.replace('/', '_')}.png"
                         img.save(var_results_dir / fname)
+                        _log_cost(user_id=user_id, operation="angles", model="gemini-3.1-flash-image-preview",
+                                  product_id=product.id, variation_id=variation.id, cost_usd=0.0)
                     job_manager.update_progress(
                         job_id,
                         0.1 + 0.7 * (done / total),
                         f"Generated {done}/{total} angles...",
                     )
+
+            if job_manager.is_cancelled(job_id):
+                return
 
             # Update variation results
             job_manager.update_progress(job_id, 0.9, "Saving results...")
@@ -1615,7 +1988,9 @@ def create_app(
         foot: str = Query("right", pattern="^(left|right)$"),
         single: bool = Query(False),
         angles: list[str] = Query(None, alias="angle"),
+        request: Request = None,
     ) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -1638,7 +2013,7 @@ def create_app(
         thread = threading.Thread(
             target=_run_generate_angles,
             args=(product, variation, job_id),
-            kwargs={"foot": foot, "single": single, "selected_angles": angles},
+            kwargs={"foot": foot, "single": single, "selected_angles": angles, "user_id": user.id},
             daemon=True,
         )
         thread.start()
@@ -1650,6 +2025,7 @@ def create_app(
         variation: Variation,
         job_id: str,
         change_request: str,
+        user_id: str = "",
     ) -> None:
         """Background thread: generates one more image and appends to variation results."""
         try:
@@ -1670,7 +2046,7 @@ def create_app(
                     agent_name_to_yaml[config.name] = yaml_file
 
             preset = None
-            for p in list_pipelines():
+            for p in _list_pipelines():
                 if p.id == variation.pipeline:
                     preset = p
                     break
@@ -1779,7 +2155,9 @@ def create_app(
         product_id: str,
         variation_id: str,
         req: RegenerateVariationRequest,
+        request: Request,
     ) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -1801,7 +2179,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_add_image,
-            args=(product, variation, job_id, req.change_request),
+            args=(product, variation, job_id, req.change_request, user.id),
             daemon=True,
         )
         thread.start()
@@ -1816,7 +2194,9 @@ def create_app(
         product_id: str,
         variation_id: str,
         source: list[str] = fastapi.Query(default=[]),
+        request: Request = None,
     ) -> dict:
+        user = _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -1841,7 +2221,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_generate_360,
-            args=(product, variation, job_id, source or None),
+            args=(product, variation, job_id, source or None, user.id),
             daemon=True,
         )
         thread.start()
@@ -1853,11 +2233,12 @@ def create_app(
         var: Variation,
         jid: str,
         source_filenames: list[str] | None = None,
+        user_id: str = "",
     ) -> None:
         """Background thread: generates a 360° spin video via Veo."""
         try:
             var_results_dir = results_dir / prod.id / var.id
-            _run_generate_360_veo(prod, var, jid, var_results_dir, source_filenames)
+            _run_generate_360_veo(prod, var, jid, var_results_dir, source_filenames, user_id)
 
         except Exception as e:
             import traceback
@@ -1872,6 +2253,7 @@ def create_app(
         jid: str,
         var_results_dir: Path,
         source_filenames: list[str] | None = None,
+        user_id: str = "",
     ) -> None:
         """Generate a 360° spin video using Google Veo."""
         import io
@@ -1944,13 +2326,10 @@ def create_app(
         client = genai.Client()
         prompt = (
             "Fast-spinning product turntable video. "
-            "The shoe in the image rotates rapidly on a motorized turntable, completing exactly one "
-            "full 360-degree revolution at constant speed. The rotation is quick, steady, "
-            "and never stops or reverses. The shoe stays perfectly centered and does not "
-            "move vertically — only rotates in place. The shoe shape, material, and color "
-            "remain exactly as shown in the image throughout the entire rotation. "
-            "Fixed tripod camera at shoe mid-height. Clean white studio background, "
-            "soft even product lighting, no shadows on the backdrop. "
+            "The shoe shown in the image spins rapidly on a motorized turntable. "
+            "The turntable completes exactly one full 360-degree revolution at constant speed. "
+            "The rotation is quick, steady, and never stops or reverses. "
+            "Fixed camera, clean gray studio background, soft product lighting. "
             "Professional e-commerce turntable spin, photorealistic."
         )
 
@@ -1973,6 +2352,7 @@ def create_app(
 
         # Poll until done
         poll_count = 0
+        retries = 0
         while not operation.done:
             poll_count += 1
             job_manager.update_progress(
@@ -1981,7 +2361,14 @@ def create_app(
                 "Generating video... (this may take a minute)",
             )
             _time.sleep(10)
-            operation = client.operations.get(operation)
+            try:
+                operation = client.operations.get(operation)
+                retries = 0
+            except Exception:
+                retries += 1
+                if retries >= 5:
+                    raise
+                _time.sleep(5)
 
         response = operation.response
         if not response or not response.generated_videos:
@@ -1999,6 +2386,12 @@ def create_app(
         video_filename = "spin_360.mp4"
         (var_results_dir / video_filename).write_bytes(video_bytes)
 
+        video_duration = 8.0
+        cost = calculate_veo_cost("veo-3.1-fast-generate-preview", "4k", video_duration)
+        _log_cost(user_id=user_id, operation="360_spin", model="veo-3.1-fast-generate-preview",
+                  product_id=prod.id, variation_id=var.id,
+                  video_seconds=video_duration, cost_usd=cost)
+
         var.spin_video = video_filename
         store.save_product(prod)
 
@@ -2008,17 +2401,177 @@ def create_app(
     @app.get(
         "/api/products/{product_id}/variations/{variation_id}/spin-video",
     )
-    def serve_spin_video(product_id: str, variation_id: str):
+    def serve_spin_video(product_id: str, variation_id: str, request: Request):
+        _get_current_user(request)
         video_path = results_dir / product_id / variation_id / "spin_360.mp4"
         if not video_path.exists():
             raise HTTPException(status_code=404, detail="Spin video not found")
         return FileResponse(video_path, media_type="video/mp4")
 
     # ----------------------------------------------------------------
+    # Hunyuan3D 2.1 — 3D model generation
+    # ----------------------------------------------------------------
+
+    _hunyuan3d_provider = None
+
+    def _get_hunyuan3d():
+        """Lazy-load the Hunyuan3D provider."""
+        nonlocal _hunyuan3d_provider
+        if _hunyuan3d_provider is None:
+            from casadei.providers.hunyuan3d import Hunyuan3DProvider
+            repo_path = os.environ.get("HUNYUAN3D_REPO_PATH", "")
+            _hunyuan3d_provider = Hunyuan3DProvider(
+                hunyuan3d_repo=repo_path if repo_path else None
+            )
+            _hunyuan3d_provider.load_model()
+        return _hunyuan3d_provider
+
+    @app.post(
+        "/api/products/{product_id}/variations/{variation_id}/generate-3d",
+        status_code=202,
+    )
+    def generate_3d(
+        product_id: str,
+        variation_id: str,
+        source: str = fastapi.Query(default=""),
+        request: Request = None,
+    ) -> dict:
+        user = _get_current_user(request)
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(status_code=404, detail="Variation not found")
+
+        if not variation.results:
+            raise HTTPException(
+                status_code=400,
+                detail="Variation has no rendered images to generate 3D from",
+            )
+
+        job_id = job_manager.create(product_id, variation.id)
+
+        thread = threading.Thread(
+            target=_run_generate_3d,
+            args=(product, variation, job_id, source or None, user.id),
+            daemon=True,
+        )
+        thread.start()
+
+        return {"job_id": job_id}
+
+    def _run_generate_3d(
+        prod: Product,
+        var: Variation,
+        jid: str,
+        source_filename: str | None = None,
+        user_id: str = "",
+    ) -> None:
+        """Background thread: generates a 3D mesh via Hunyuan3D 2.1."""
+        try:
+            var_results_dir = results_dir / prod.id / var.id
+            var_results_dir.mkdir(parents=True, exist_ok=True)
+
+            job_manager.update_progress(jid, 0.05, "Loading source image...")
+
+            # Pick source image
+            source_path: Path | None = None
+            if source_filename:
+                p = var_results_dir / source_filename
+                if p.exists():
+                    source_path = p
+            if not source_path:
+                # Prefer front-facing angles
+                for candidate in ["front.png", "3_4.png", "hero-front-left.png"]:
+                    p = var_results_dir / candidate
+                    if p.exists():
+                        source_path = p
+                        break
+                if not source_path:
+                    source_path = var_results_dir / var.results[0].filename
+
+            if not source_path.exists():
+                raise FileNotFoundError(f"Source image not found: {source_path}")
+
+            job_manager.update_progress(jid, 0.1, "Loading Hunyuan3D model...")
+
+            provider = _get_hunyuan3d()
+
+            job_manager.update_progress(jid, 0.2, "Generating 3D shape...")
+
+            output_dir = var_results_dir / "_3d_temp"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            glb_path = provider.generate(
+                image_path=source_path,
+                output_dir=output_dir,
+                num_inference_steps=30,
+                guidance_scale=7.5,
+                octree_resolution=256,
+                texture=True,
+            )
+
+            job_manager.update_progress(jid, 0.9, "Saving 3D model...")
+
+            # Move final GLB to variation directory
+            final_glb = var_results_dir / "model_3d.glb"
+            if glb_path != final_glb:
+                import shutil
+                shutil.move(str(glb_path), str(final_glb))
+
+            # Clean up temp dir
+            import shutil
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+            # Update variation
+            var.model_3d = "model_3d.glb"
+            store.save_product(prod)
+
+            # Log cost (local GPU — no API cost, but track for usage stats)
+            _log_cost(
+                user_id=user_id,
+                operation="3d_model",
+                model="hunyuan3d-2.1",
+                product_id=prod.id,
+                variation_id=var.id,
+                cost_usd=0.0,
+            )
+
+            job_manager.update_progress(jid, 1.0, "3D model ready!")
+            job_manager.complete(jid)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            var.status = JobStatus.failed
+            store.save_product(prod)
+            job_manager.fail(jid, str(e))
+
+    @app.get(
+        "/api/products/{product_id}/variations/{variation_id}/model-3d",
+    )
+    def serve_model_3d(product_id: str, variation_id: str):
+        var_dir = results_dir / product_id / variation_id
+        # Check multiple possible locations
+        for candidate in [
+            var_dir / "model_3d.glb",
+            var_dir / "_3d_hq" / "model_3d.glb",
+        ]:
+            if candidate.exists():
+                return FileResponse(candidate, media_type="model/gltf-binary")
+        raise HTTPException(status_code=404, detail="3D model not found")
+
+    # ----------------------------------------------------------------
     # Gemini-powered variation tools: try-on, context, accessories
     # ----------------------------------------------------------------
 
-    def _gemini_edit(images: list, prompt: str) -> bytes:
+    def _gemini_edit(images: list, prompt: str) -> tuple[bytes, dict]:
         """Call Gemini Flash Image Edit and return the result as PNG bytes."""
         import io as _io
 
@@ -2073,9 +2626,11 @@ def create_app(
             ),
         )
 
+        usage = extract_token_usage(getattr(response, "usage_metadata", None))
+
         for part in response.parts:
             if part.inline_data is not None:
-                return part.inline_data.data
+                return part.inline_data.data, usage
 
         raise RuntimeError("Gemini returned no image — request may have been refused.")
 
@@ -2122,7 +2677,9 @@ def create_app(
         product_id: str,
         variation_id: str,
         model_photo: UploadFile = fastapi.File(...),
+        request: Request = None,
     ) -> dict:
+        user = _get_current_user(request)
         product, variation = _find_variation(product_id, variation_id)
         if not variation.results:
             raise HTTPException(status_code=400, detail="Variation has no images")
@@ -2137,7 +2694,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_try_on,
-            args=(product, variation, job_id, photo_path),
+            args=(product, variation, job_id, photo_path, user.id),
             daemon=True,
         )
         thread.start()
@@ -2148,6 +2705,7 @@ def create_app(
         var: Variation,
         jid: str,
         photo_path: Path,
+        user_id: str = "",
     ) -> None:
         try:
             from PIL import Image as PILImage
@@ -2168,7 +2726,13 @@ def create_app(
                 f"fashion photograph. Photorealistic, high quality."
             )
 
-            img_bytes = _gemini_edit([model_img, shoe_img], prompt)
+            img_bytes, usage = _gemini_edit([model_img, shoe_img], prompt)
+
+            cost = calculate_cost("gemini-3.1-flash-image-preview", usage)
+            _log_cost(user_id=user_id, operation="try_on", model="gemini-3.1-flash-image-preview",
+                      product_id=prod.id, variation_id=var.id,
+                      input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
+                      thinking_tokens=usage.get("thinking_tokens", 0), cost_usd=cost)
 
             job_manager.update_progress(jid, 0.9, "Saving result...")
             _save_gemini_result(prod, var, img_bytes, "try-on", "gemini_tryon")
@@ -2192,7 +2756,9 @@ def create_app(
         variation_id: str,
         scene: str = fastapi.Query(...),
         prompt: str = fastapi.Query(""),
+        request: Request = None,
     ) -> dict:
+        user = _get_current_user(request)
         product, variation = _find_variation(product_id, variation_id)
         if not variation.results:
             raise HTTPException(status_code=400, detail="Variation has no images")
@@ -2201,7 +2767,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_create_context,
-            args=(product, variation, job_id, scene, prompt),
+            args=(product, variation, job_id, scene, prompt, user.id),
             daemon=True,
         )
         thread.start()
@@ -2213,6 +2779,7 @@ def create_app(
         jid: str,
         scene: str,
         extra_prompt: str,
+        user_id: str = "",
     ) -> None:
         try:
             from PIL import Image as PILImage
@@ -2244,7 +2811,13 @@ def create_app(
             if extra_prompt:
                 prompt += f" {extra_prompt}"
 
-            img_bytes = _gemini_edit([shoe_img], prompt)
+            img_bytes, usage = _gemini_edit([shoe_img], prompt)
+
+            cost = calculate_cost("gemini-3.1-flash-image-preview", usage)
+            _log_cost(user_id=user_id, operation="context", model="gemini-3.1-flash-image-preview",
+                      product_id=prod.id, variation_id=var.id,
+                      input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
+                      thinking_tokens=usage.get("thinking_tokens", 0), cost_usd=cost)
 
             job_manager.update_progress(jid, 0.9, "Saving result...")
             _save_gemini_result(prod, var, img_bytes, "context", "gemini_context")
@@ -2268,7 +2841,9 @@ def create_app(
         variation_id: str,
         accessory_images: list[UploadFile] = fastapi.File(...),
         instruction: str = fastapi.Form(""),
+        request: Request = None,
     ) -> dict:
+        user = _get_current_user(request)
         product, variation = _find_variation(product_id, variation_id)
         if not variation.results:
             raise HTTPException(status_code=400, detail="Variation has no images")
@@ -2286,7 +2861,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_apply_accessories,
-            args=(product, variation, job_id, acc_paths, instruction.strip()),
+            args=(product, variation, job_id, acc_paths, instruction.strip(), user.id),
             daemon=True,
         )
         thread.start()
@@ -2298,6 +2873,7 @@ def create_app(
         jid: str,
         accessory_paths: list[Path],
         instruction: str = "",
+        user_id: str = "",
     ) -> None:
         try:
             from PIL import Image as PILImage
@@ -2319,7 +2895,13 @@ def create_app(
                 f"Do not change anything else about the photo."
             )
 
-            img_bytes = _gemini_edit([shoe_img] + acc_imgs, prompt)
+            img_bytes, usage = _gemini_edit([shoe_img] + acc_imgs, prompt)
+
+            cost = calculate_cost("gemini-3.1-flash-image-preview", usage)
+            _log_cost(user_id=user_id, operation="accessories", model="gemini-3.1-flash-image-preview",
+                      product_id=prod.id, variation_id=var.id,
+                      input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
+                      thinking_tokens=usage.get("thinking_tokens", 0), cost_usd=cost)
 
             job_manager.update_progress(jid, 0.9, "Saving result...")
             _save_gemini_result(prod, var, img_bytes, "accessories", "gemini_accessories")
@@ -2340,13 +2922,17 @@ def create_app(
         product_id: str,
         variation_id: str,
         req: UpdateVariationMetaRequest,
+        request: Request,
     ) -> dict:
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
 
         for v in product.variations:
             if v.id == variation_id:
+                if req.name is not None:
+                    v.name = req.name
                 if req.price_tier is not None:
                     v.price_tier = req.price_tier
                 if req.theme is not None:
@@ -2355,10 +2941,47 @@ def create_app(
                     v.feature = req.feature
                 store.save_product(product)
                 return {
+                    "name": v.name,
                     "price_tier": v.price_tier,
                     "theme": v.theme,
                     "feature": v.feature,
                 }
+
+        raise HTTPException(status_code=404, detail="Variation not found")
+
+    @app.put("/api/products/{product_id}/variations/{variation_id}/select-hero")
+    def select_hero_candidate(
+        product_id: str,
+        variation_id: str,
+        req: SelectHeroCandidateRequest,
+        request: Request,
+    ) -> dict:
+        """Switch the active hero to a different candidate."""
+        _get_current_user(request)
+        fname = req.filename
+
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        for v in product.variations:
+            if v.id == variation_id:
+                # Verify the candidate file exists
+                candidate_path = results_dir / product_id / variation_id / fname
+                if not candidate_path.exists():
+                    raise HTTPException(status_code=404, detail="Candidate file not found")
+
+                # Copy candidate to hero.png
+                import shutil
+                hero_path = results_dir / product_id / variation_id / "hero.png"
+                shutil.copy2(candidate_path, hero_path)
+
+                # Update selected flags
+                for c in v.hero_candidates:
+                    c.selected = (c.filename == fname)
+
+                store.save_product(product)
+                return {"ok": True, "selected": fname}
 
         raise HTTPException(status_code=404, detail="Variation not found")
 
@@ -2367,8 +2990,9 @@ def create_app(
         status_code=204,
     )
     def delete_variation(
-        product_id: str, variation_id: str,
+        product_id: str, variation_id: str, request: Request,
     ):
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -2388,8 +3012,9 @@ def create_app(
         status_code=204,
     )
     def delete_variation_result(
-        product_id: str, variation_id: str, filename: str,
+        product_id: str, variation_id: str, filename: str, request: Request,
     ):
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -2425,7 +3050,9 @@ def create_app(
         product_id: str,
         variation_id: str,
         req: dict,
+        request: Request,
     ) -> dict:
+        _get_current_user(request)
         product = store.get_product(product_id)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -2458,17 +3085,20 @@ def create_app(
     # ── Collections ──────────────────────────────────────────────
 
     @app.get("/api/collections")
-    def list_collections() -> list[Collection]:
+    def list_collections(request: Request) -> list[Collection]:
+        _get_current_user(request)
         return store.list_collections()
 
     @app.post("/api/collections", status_code=201)
-    def create_collection(req: CreateCollectionRequest) -> Collection:
+    def create_collection(req: CreateCollectionRequest, request: Request) -> Collection:
+        _get_current_user(request)
         collection = Collection(name=req.name)
         store.save_collection(collection)
         return collection
 
     @app.get("/api/collections/{collection_id}")
-    def get_collection(collection_id: str) -> Collection:
+    def get_collection(collection_id: str, request: Request) -> Collection:
+        _get_current_user(request)
         collection = store.get_collection(collection_id)
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")
@@ -2476,8 +3106,9 @@ def create_app(
 
     @app.put("/api/collections/{collection_id}")
     def update_collection(
-        collection_id: str, req: UpdateCollectionRequest
+        collection_id: str, req: UpdateCollectionRequest, request: Request,
     ) -> Collection:
+        _get_current_user(request)
         collection = store.get_collection(collection_id)
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")
@@ -2487,14 +3118,16 @@ def create_app(
         return collection
 
     @app.delete("/api/collections/{collection_id}", status_code=204)
-    def delete_collection(collection_id: str):
+    def delete_collection(collection_id: str, request: Request):
+        _get_current_user(request)
         if not store.delete_collection(collection_id):
             raise HTTPException(status_code=404, detail="Collection not found")
 
     @app.post("/api/collections/{collection_id}/products", status_code=200)
     def add_product_to_collection(
-        collection_id: str, req: AddProductToCollectionRequest
+        collection_id: str, req: AddProductToCollectionRequest, request: Request,
     ) -> Collection:
+        _get_current_user(request)
         collection = store.get_collection(collection_id)
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")
@@ -2511,8 +3144,9 @@ def create_app(
         status_code=200,
     )
     def remove_product_from_collection(
-        collection_id: str, product_id: str
+        collection_id: str, product_id: str, request: Request,
     ) -> Collection:
+        _get_current_user(request)
         collection = store.get_collection(collection_id)
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")
@@ -2526,8 +3160,9 @@ def create_app(
 
     @app.put("/api/collections/{collection_id}/reorder", status_code=200)
     def reorder_collection_products(
-        collection_id: str, body: dict
+        collection_id: str, body: dict, request: Request,
     ) -> Collection:
+        _get_current_user(request)
         collection = store.get_collection(collection_id)
         if not collection:
             raise HTTPException(status_code=404, detail="Collection not found")
@@ -2566,7 +3201,8 @@ def create_app(
         return vector_db
 
     @app.post("/api/search/index", status_code=200)
-    def index_all_variants() -> dict:
+    def index_all_variants(request: Request) -> dict:
+        _get_current_user(request)
         """Index all product variations incrementally.
 
         Only variants whose text has changed or that are new will be
@@ -2604,7 +3240,8 @@ def create_app(
         }
 
     @app.post("/api/search/index/{product_id}/{variation_id}", status_code=200)
-    def index_single_variant(product_id: str, variation_id: str) -> dict:
+    def index_single_variant(product_id: str, variation_id: str, request: Request) -> dict:
+        _get_current_user(request)
         """Index (or re-index) a single variation."""
         db = _require_vector_db()
         product = store.get_product(product_id)
@@ -2624,7 +3261,8 @@ def create_app(
         return {"indexed": created, "text": text}
 
     @app.delete("/api/search/index/{product_id}/{variation_id}", status_code=200)
-    def remove_variant_from_index(product_id: str, variation_id: str) -> dict:
+    def remove_variant_from_index(product_id: str, variation_id: str, request: Request) -> dict:
+        _get_current_user(request)
         """Remove a single variation from the search index."""
         db = _require_vector_db()
         removed = db.remove_variant(product_id, variation_id)
@@ -2635,7 +3273,8 @@ def create_app(
         return {"removed": True}
 
     @app.post("/api/search")
-    def search_variants(req: SearchRequest) -> SearchResponse:
+    def search_variants(req: SearchRequest, request: Request) -> SearchResponse:
+        _get_current_user(request)
         """Semantic search over indexed product variations.
 
         Normalizes the query, checks cache, embeds if needed,
@@ -2659,12 +3298,100 @@ def create_app(
         )
 
     @app.get("/api/search/stats")
-    def search_stats() -> IndexStats:
+    def search_stats(request: Request) -> IndexStats:
+        _get_current_user(request)
         """Return current index statistics."""
         db = _require_vector_db()
         return IndexStats(
             indexed_variants=db.indexed_count,
             cached_queries=db.cached_queries_count,
         )
+
+    # --- Admin cost endpoints ---
+
+    @app.get("/api/admin/costs/summary")
+    def admin_costs_summary(request: Request):
+        _require_admin(request)
+        from datetime import date
+        today = date.today().isoformat()
+        all_costs = store.list_costs()
+        today_costs = [c for c in all_costs if c.timestamp.startswith(today)]
+
+        user_totals: dict[str, float] = {}
+        user_calls: dict[str, int] = {}
+        for c in all_costs:
+            user_totals[c.user_id] = user_totals.get(c.user_id, 0) + c.cost_usd
+            user_calls[c.user_id] = user_calls.get(c.user_id, 0) + 1
+
+        per_user = []
+        for uid, total in sorted(user_totals.items(), key=lambda x: -x[1]):
+            u = store.get_user(uid)
+            per_user.append({
+                "user_id": uid,
+                "name": u.name if u else "Unknown",
+                "total_cost": round(total, 4),
+                "calls": user_calls.get(uid, 0),
+            })
+
+        return {
+            "total_cost": round(sum(c.cost_usd for c in all_costs), 4),
+            "today_cost": round(sum(c.cost_usd for c in today_costs), 4),
+            "today_calls": len(today_costs),
+            "total_calls": len(all_costs),
+            "per_user": per_user,
+        }
+
+    @app.get("/api/admin/costs/daily")
+    def admin_costs_daily(request: Request, days: int = Query(default=30)):
+        _require_admin(request)
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        costs = store.list_costs(since=cutoff)
+
+        daily: dict[str, dict] = {}
+        for c in costs:
+            day = c.timestamp[:10]
+            if day not in daily:
+                daily[day] = {"date": day, "cost": 0.0, "calls": 0}
+            daily[day]["cost"] += c.cost_usd
+            daily[day]["calls"] += 1
+
+        result = sorted(daily.values(), key=lambda x: x["date"], reverse=True)
+        for r in result:
+            r["cost"] = round(r["cost"], 4)
+        return result
+
+    @app.get("/api/admin/costs/details")
+    def admin_costs_details(request: Request, date_str: str = Query(..., alias="date")):
+        _require_admin(request)
+        costs = store.list_costs(since=date_str, until=date_str + "T23:59:59")
+        result = []
+        for c in costs:
+            u = store.get_user(c.user_id)
+            product = store.get_product(c.product_id) if c.product_id else None
+            variation_label = ""
+            if product and c.variation_id:
+                for v in product.variations:
+                    if v.id == c.variation_id:
+                        parts = [p for p in [v.material, v.color] if p]
+                        variation_label = " / ".join(parts) if parts else f"Variation {v.id[:6]}"
+                        break
+            result.append({
+                "id": c.id,
+                "timestamp": c.timestamp,
+                "user_name": u.name if u else "Unknown",
+                "operation": c.operation,
+                "model": c.model,
+                "product_id": c.product_id,
+                "variation_id": c.variation_id,
+                "product_name": product.name if product else "",
+                "variation_label": variation_label,
+                "input_tokens": c.input_tokens,
+                "output_tokens": c.output_tokens,
+                "thinking_tokens": c.thinking_tokens,
+                "video_seconds": c.video_seconds,
+                "cost_usd": round(c.cost_usd, 6),
+            })
+        return result
 
     return app
