@@ -1,0 +1,277 @@
+# Single source of truth for all camera angle data used across shoe generation workflows.
+# Extracted from tests/run_shoe_angles.py
+
+judge_notes: |
+  EVALUATE camera_angle using these steps in order:
+
+  STEP A — OBSERVE FIRST.
+    Write your answers into observations["camera_angle"] before scoring:
+    - Which direction does the TOE BOX point in the frame? (LEFT / RIGHT / CENTER / AWAY)
+    - Which part of the shoe is the primary subject facing the camera? (toe box front / heel back / outer side / inner side / top)
+
+  STEP B — COMPARE to the spec.
+    Read the spec carefully. Check ONLY what the spec explicitly states — do not invent additional requirements that are not mentioned.
+    Score 4-5: what you observed in Step A satisfies the spec's stated requirements.
+    Score 3: the angle is mostly right but has a minor deviation from the spec.
+    Score 1-2: the angle is clearly and fundamentally wrong (e.g. spec says toe-front but heel is facing camera, or spec says left but toe points right).
+    IMPORTANT: Be lenient with head-on front/rear/top views. For a front view, seeing the interior (insole, straps) is normal and correct — do NOT penalise a front view for showing the inside of the shoe. Do NOT penalise camera height, exact elevation angle, Dutch tilt, or minor staging variations.
+
+  STEP C — REPAIR (only if score ≤ 3):
+    State one concrete fix describing the required output state. For angled shots: name which direction the toe must point (LEFT / RIGHT / CENTER) and which part of the shoe should face the camera. Do NOT write 'rotate' or 'adjust the camera' — only describe what the final image must show.
+
+canonical_angles:
+  - "3/4"
+  - "side"
+  - "front"
+  - "back"
+  - "top"
+  - "hero-front-right"
+  - "hero-front-left"
+  - "hero-back-right"
+  - "hero-back-left"
+
+pair_angles:
+  - "3/4"
+  - "front"
+
+single_angles:
+  - "side"
+  - "back"
+  - "top"
+  - "hero-front-right"
+  - "hero-front-left"
+  - "hero-back-right"
+  - "hero-back-left"
+
+aliases:
+  "3/4 view": "3/4"
+  "side view": "side"
+  "front view": "front"
+  "back view": "back"
+  "top view": "top"
+  "hero": "hero-front-right"
+
+presets:
+  "3/4":
+    pair:
+      camera_desc: >-
+        Low, ground-level angle, shooting almost parallel to the platform.
+        The camera is positioned slightly to the right, looking leftwards
+        at the shoes (3/4).
+      staging_desc: >-
+        A pair of shoes perfectly aligned and parallel, touching side by side,
+        both pointing in the same direction at the same angle.
+    left:
+      camera_desc: >-
+        Low, ground-level angle, shooting almost parallel to the platform.
+        The camera is positioned slightly to the left, looking rightwards
+        at the left shoe (3/4 from the left).
+      staging_desc: "The left shoe centered on the white surface."
+    right:
+      camera_desc: >-
+        Low, ground-level angle, shooting almost parallel to the platform.
+        The camera is positioned slightly to the right, looking leftwards
+        at the right shoe (3/4 from the right).
+      staging_desc: "The right shoe centered on the white surface."
+
+  "side":
+    pair:
+      camera_desc: >-
+        Straight side-on profile view, camera at shoe mid-height,
+        perpendicular to the shoes' length axis. The full silhouette
+        from toe to heel is visible for both shoes.
+      staging_desc: >-
+        A pair of shoes placed side by side on the white surface showing
+        their complete lateral profile.
+    left:
+      camera_desc: >-
+        Straight side-on profile view from the left (medial side),
+        camera at shoe mid-height, perpendicular to the left shoe's
+        length axis.
+      staging_desc: "The left shoe centered, medial side facing the camera."
+    right:
+      camera_desc: >-
+        Straight side-on profile view from the right (lateral side),
+        camera at shoe mid-height, perpendicular to the right shoe's
+        length axis.
+      staging_desc: "The right shoe centered, lateral side facing the camera."
+
+  "front":
+    pair:
+      camera_desc: >-
+        Head-on front view at shoe mid-height, camera looking straight
+        at the toe boxes. Both shoes are visible, slightly angled outward.
+      staging_desc: >-
+        A pair of shoes placed next to each other, toe boxes facing
+        the camera.
+    left:
+      camera_desc: >-
+        Head-on front view at shoe mid-height, camera looking straight
+        at the toe box of the left shoe.
+      staging_desc: "The left shoe centered, toe box facing the camera."
+    right:
+      camera_desc: >-
+        Head-on front view at shoe mid-height, camera looking straight
+        at the toe box of the right shoe.
+      staging_desc: "The right shoe centered, toe box facing the camera."
+
+  "back":
+    pair:
+      camera_desc: >-
+        Rear view at shoe mid-height, camera looking straight at the heels.
+        Both shoes are visible, showing the heel counter and back stitching.
+      staging_desc: >-
+        A pair of shoes placed next to each other, heels facing the camera.
+    left:
+      camera_desc: >-
+        Rear view at shoe mid-height, camera looking straight at the heel
+        of the left shoe, showing the heel counter and back stitching.
+      staging_desc: "The left shoe centered, heel facing the camera."
+    right:
+      camera_desc: >-
+        Rear view at shoe mid-height, camera looking straight at the heel
+        of the right shoe, showing the heel counter and back stitching.
+      staging_desc: "The right shoe centered, heel facing the camera."
+
+  "top":
+    pair:
+      camera_desc: >-
+        Directly overhead bird's-eye view, camera pointing straight down.
+        The full footbed outline from toe to heel is visible for both shoes.
+      staging_desc: >-
+        A pair of shoes placed next to each other on the white surface,
+        viewed from above.
+    left:
+      camera_desc: >-
+        Directly overhead bird's-eye view, camera pointing straight down
+        at the left shoe. The full footbed outline from toe to heel is visible.
+      staging_desc: "The left shoe centered on the white surface, viewed from above."
+    right:
+      camera_desc: >-
+        Directly overhead bird's-eye view, camera pointing straight down
+        at the right shoe. The full footbed outline from toe to heel is visible.
+      staging_desc: "The right shoe centered on the white surface, viewed from above."
+
+  "hero-front-right":
+    pair:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the toe boxes of both shoes point toward the LEFT side of the frame;
+        the heels recede toward the RIGHT-BACK.
+        The RIGHT/OUTER sides of both shoes face the camera — the left/inner sides are turned away and NOT visible.
+      staging_desc: >-
+        A pair of shoes on the white surface filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    left:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the toe box points toward the LEFT side of the frame;
+        the heel recedes toward the RIGHT-BACK.
+        The OUTER/LATERAL side of the left shoe faces the camera —
+        the inner/medial (arch) side is turned away and NOT visible.
+      staging_desc: >-
+        The left shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    right:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the toe box points toward the LEFT side of the frame;
+        the heel recedes toward the RIGHT-BACK.
+        The INNER/MEDIAL (arch) side of the right shoe faces the camera —
+        the outer/lateral side is turned away and NOT visible.
+      staging_desc: >-
+        The right shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+
+  "hero-front-left":
+    pair:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the toe boxes of both shoes point toward the RIGHT side of the frame;
+        the heels recede toward the LEFT-BACK.
+        The LEFT/INNER sides of both shoes face the camera — the right/outer sides are turned away and NOT visible.
+      staging_desc: >-
+        A pair of shoes on the white surface filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    left:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the toe box points toward the RIGHT side of the frame;
+        the heel recedes toward the LEFT-BACK.
+        The INNER/MEDIAL (arch) side of the left shoe faces the camera —
+        the outer/lateral side is turned away and NOT visible.
+      staging_desc: >-
+        The left shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    right:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the toe box points toward the RIGHT side of the frame;
+        the heel recedes toward the LEFT-BACK.
+        The OUTER/LATERAL side of the right shoe faces the camera —
+        the inner/medial (arch) side is turned away and NOT visible.
+      staging_desc: >-
+        The right shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+
+  "hero-back-right":
+    pair:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the heel counters are in the LEFT-FRONT area of the frame;
+        the toe boxes recede toward the RIGHT-BACK.
+        The RIGHT/OUTER sides of both shoes face the camera — the left/inner sides are turned away and NOT visible.
+      staging_desc: >-
+        A pair of shoes on the white surface filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    left:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the heel counter is in the LEFT-FRONT area of the frame;
+        the toe recedes toward the RIGHT-BACK.
+        The OUTER/LATERAL side of the left shoe faces the camera —
+        the inner/medial (arch) side is turned away and NOT visible.
+      staging_desc: >-
+        The left shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    right:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the heel counter is in the LEFT-FRONT area of the frame;
+        the toe recedes toward the RIGHT-BACK.
+        The INNER/MEDIAL (arch) side of the right shoe faces the camera —
+        the outer/lateral side is turned away and NOT visible.
+      staging_desc: >-
+        The right shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+
+  "hero-back-left":
+    pair:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the heel counters are in the RIGHT-FRONT area of the frame;
+        the toe boxes recede toward the LEFT-BACK.
+        The LEFT/INNER sides of both shoes face the camera — the right/outer sides are turned away and NOT visible.
+      staging_desc: >-
+        A pair of shoes on the white surface filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    left:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the heel counter is in the RIGHT-FRONT area of the frame;
+        the toe recedes toward the LEFT-BACK.
+        The INNER/MEDIAL (arch) side of the left shoe faces the camera —
+        the outer/lateral side is turned away and NOT visible.
+      staging_desc: >-
+        The left shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.
+    right:
+      camera_desc: >-
+        Dynamic low hero shot (~30° elevation from ground).
+        In the output image: the heel counter is in the RIGHT-FRONT area of the frame;
+        the toe recedes toward the LEFT-BACK.
+        The OUTER/LATERAL side of the right shoe faces the camera —
+        the inner/medial (arch) side is turned away and NOT visible.
+      staging_desc: >-
+        The right shoe filling the frame with dramatic presence.
+        Slight Dutch tilt.

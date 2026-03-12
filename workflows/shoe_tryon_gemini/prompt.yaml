@@ -1,0 +1,8 @@
+prompt_template: |
+  Replace the shoes on the person's feet with the exact shoe shown in the first image. Match every visible detail of the reference shoe: color, material, heel shape, toe shape, straps, and hardware. Replace BOTH shoes — left foot AND right foot. Preserve the person's pose, legs, clothing, and background exactly. $feedback
+
+default_params:
+  max_iterations: 3
+  tolerance: moderate
+
+negative_prompt: ""

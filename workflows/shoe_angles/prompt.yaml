@@ -1,0 +1,10 @@
+prompt_template: |
+  The first image is the original shoe design sketch. The second image is a photorealistic product photograph of this exact shoe — use it as the definitive reference for everything: material, color, texture, proportions, and design details.
+
+  Generate the exact same shoe from this camera angle:
+  - Camera angle: {camera_desc}
+  - Shoe alignment and staging: {staging_desc}
+
+  {foot_framing}
+
+  The result must be a studio-quality photograph: clean white background, professional product lighting, sharp focus, no shadows on background. The shoe must look identical to the reference — only the viewing angle changes.{feedback}

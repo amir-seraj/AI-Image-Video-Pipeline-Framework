@@ -1,0 +1,16 @@
+prompt_template: |
+  Generate a studio product photo of the shoe shown in the sketch.
+  Study the sketch carefully before generating. Reproduce every line and every open area exactly as drawn — if a structural part is not drawn in the sketch, it must not appear in the photo. Do not add, complete, or assume any structure that is absent from the sketch. Apply the materials below on top of the sketch shape. Shoot at the specified camera angle — do not copy the sketch's viewpoint.
+
+  Materials: $material
+
+  Camera angle: $camera_desc
+  Staging: $staging_desc
+  $extra_specs
+  Clean white background, professional studio lighting, sharp focus. $foot_framing
+  $feedback
+
+default_params:
+  temperature: 0.8
+
+negative_prompt: ""

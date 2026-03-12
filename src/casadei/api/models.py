@@ -68,6 +68,8 @@ class Variation(BaseModel):
     material: str = ""
     color: str = ""
     note: str = ""
+    material_image: str = ""
+    color_image: str = ""
     pipeline: str = ""
     num_outputs: int = 1
     results: list[ResultFile] = []
@@ -113,6 +115,8 @@ class CreateVariationRequest(BaseModel):
     material: str = ""
     color: str = ""
     note: str = ""
+    material_image: str = ""
+    color_image: str = ""
     pipeline: str
     num_outputs: int = 1
 
