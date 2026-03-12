@@ -1548,15 +1548,15 @@ def create_app(
             from PIL import Image as PILImage
             from casadei import ImageMedia, LoggedPipeline
 
-            # Add paths for imports
+            # Add workflow paths for imports
             _project_root = Path(__file__).resolve().parent.parent.parent.parent
-            _scripts_dir = _project_root / "workflows" / "sketch_to_shoe" / "scripts"
-            _tests_dir = _project_root / "tests"
-            for p in [str(_scripts_dir), str(_tests_dir)]:
+            _workflows_dir = _project_root / "workflows"
+            for p in [str(_workflows_dir / "shared"), str(_workflows_dir / "sketch_to_shoe" / "scripts")]:
                 if p not in _sys.path:
                     _sys.path.insert(0, p)
 
-            from run_sketch_to_shoe_gemini_direct import build_pipeline, _build_sketch_grid
+            from workflows.sketch_to_shoe_gemini.pipeline import build_pipeline
+            from image_utils import build_sketch_grid
             from judge import VLMSession
 
             job_manager.update_progress(job_id, 0.05, "Loading sketches...")
@@ -1572,7 +1572,7 @@ def create_app(
                 job_manager.fail(job_id, "No sketch images found")
                 return
 
-            sketch_grid = _build_sketch_grid(raw_sketches)
+            sketch_grid = build_sketch_grid(raw_sketches)
             sketch_media = ImageMedia(image=sketch_grid)
 
             # Build material spec from variation fields
@@ -1595,17 +1595,65 @@ def create_app(
             if change_request:
                 extra_spec["change_request"] = change_request
 
+            # Load reference images if available (may be uploaded concurrently)
+            import time as _time
+            ref_images: dict[str, "ImageMedia"] = {}
+            var_results_dir = results_dir / product.id / variation.id
+            var_results_dir.mkdir(parents=True, exist_ok=True)
+            # Brief wait for concurrent ref image uploads to land
+            _time.sleep(1.5)
+            # Re-read variation in case ref images were uploaded after creation
+            _fresh = store.get_product(product.id)
+            if _fresh:
+                for _v in _fresh.variations:
+                    if _v.id == variation.id:
+                        variation.material_image = _v.material_image
+                        variation.color_image = _v.color_image
+                        break
+            if variation.material_image:
+                ref_path = var_results_dir / variation.material_image
+                if ref_path.exists():
+                    ref_images["material_ref"] = ImageMedia(
+                        image=PILImage.open(ref_path).convert("RGB")
+                    )
+            if variation.color_image:
+                ref_path = var_results_dir / variation.color_image
+                if ref_path.exists():
+                    ref_images["color_ref"] = ImageMedia(
+                        image=PILImage.open(ref_path).convert("RGB")
+                    )
+
+            # Load material images if available (material-image mode)
+            materials_list = None
+            materials_meta_path = var_results_dir / "materials_meta.json"
+            if materials_meta_path.exists():
+                import json as _json
+                meta_list = _json.loads(materials_meta_path.read_text())
+                if meta_list:
+                    materials_list = []
+                    for entry in sorted(meta_list, key=lambda e: e["index"]):
+                        img_path = var_results_dir / f"ref_mat_{entry['index']}.png"
+                        if img_path.exists():
+                            materials_list.append({
+                                "name": entry.get("name"),
+                                "image": PILImage.open(img_path).convert("RGB"),
+                                "placement": entry.get("placement"),
+                                "note": entry.get("note"),
+                                "is_color": entry.get("is_color", False),
+                            })
+
             spec = {
                 "material": material_str,
                 "camera_angle": "3/4",
                 "extra": extra_spec,
+                "ref_images": ref_images,
             }
+            if materials_list:
+                spec["materials"] = materials_list
 
             NUM_HERO_CANDIDATES = 2
 
             job_manager.update_progress(job_id, 0.05, "Generating hero candidates...")
-
-            var_results_dir = results_dir / product.id / variation.id
             var_results_dir.mkdir(parents=True, exist_ok=True)
 
             from casadei.loop import LoopResult as _LoopResult
@@ -1623,17 +1671,23 @@ def create_app(
 
                 vlm_session = VLMSession("gemini_flash_lite")
                 try:
-                    pipeline, edit_agent, _vlm_sessions = build_pipeline(
+                    pipeline, edit_agent, _vlm_sessions, grid_image = build_pipeline(
                         spec=spec,
                         vlm_session=vlm_session,
                         foot="pair",
                         temperature=0.8,
                     )
                     logged = LoggedPipeline(pipeline)
-                    context = {
+                    context: dict = {
                         "sketch": sketch_media,
                         "image": sketch_media,
                     }
+                    # Add materials grid or reference images to context
+                    if grid_image is not None:
+                        context["materials_grid"] = ImageMedia(image=grid_image)
+                    else:
+                        for ref_key, ref_media in ref_images.items():
+                            context[ref_key] = ref_media
 
                     # Progress monitor for this run
                     _progress_done = threading.Event()
@@ -1750,6 +1804,8 @@ def create_app(
             material=req.material,
             color=req.color,
             note=req.note,
+            material_image=req.material_image,
+            color_image=req.color_image,
             pipeline=req.pipeline,
             num_outputs=req.num_outputs,
             status=JobStatus.pending,
@@ -1767,6 +1823,151 @@ def create_app(
         thread.start()
 
         return {"job_id": job_id, "variation_id": variation.id}
+
+    @app.post(
+        "/api/products/{product_id}/variations/{variation_id}/ref-image",
+        status_code=200,
+    )
+    async def upload_variation_ref_image(
+        product_id: str,
+        variation_id: str,
+        file: UploadFile,
+        kind: str = fastapi.Query(..., regex="^(material|color)$"),
+        request: Request = None,
+    ):
+        """Upload a reference image (material or color) for a variation."""
+        _get_current_user(request)
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(status_code=404, detail="Variation not found")
+
+        var_dir = results_dir / product_id / variation_id
+        var_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"ref_{kind}.png"
+        dest = var_dir / filename
+        content = await file.read()
+        from PIL import Image as PILImage
+        import io
+        img = PILImage.open(io.BytesIO(content)).convert("RGB")
+        img.save(str(dest), "PNG")
+
+        if kind == "material":
+            variation.material_image = filename
+        else:
+            variation.color_image = filename
+        store.save_product(product)
+
+        return {"filename": filename}
+
+    @app.post(
+        "/api/products/{product_id}/variations/{variation_id}/ref-material",
+        status_code=200,
+    )
+    async def upload_variation_ref_material(
+        product_id: str,
+        variation_id: str,
+        file: UploadFile,
+        index: int = fastapi.Query(...),
+        name: str = fastapi.Query(""),
+        placement: str = fastapi.Query(""),
+        note: str = fastapi.Query(""),
+        is_color: bool = fastapi.Query(False),
+        request: Request = None,
+    ):
+        """Upload a material/color reference image for a variation."""
+        _get_current_user(request)
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(status_code=404, detail="Variation not found")
+
+        var_dir = results_dir / product_id / variation_id
+        var_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save image
+        filename = f"ref_mat_{index}.png"
+        content = await file.read()
+        from PIL import Image as PILImage
+        import io
+        img = PILImage.open(io.BytesIO(content)).convert("RGB")
+        img.save(str(var_dir / filename), "PNG")
+
+        # Update materials_meta.json
+        import json as _json
+        meta_path = var_dir / "materials_meta.json"
+        meta_list = []
+        if meta_path.exists():
+            meta_list = _json.loads(meta_path.read_text())
+
+        # Remove existing entry with same index (overwrite)
+        meta_list = [e for e in meta_list if e["index"] != index]
+        meta_list.append({
+            "index": index,
+            "name": name or None,
+            "placement": placement or None,
+            "note": note or None,
+            "is_color": is_color,
+        })
+        meta_list.sort(key=lambda e: e["index"])
+        meta_path.write_text(_json.dumps(meta_list, indent=2))
+
+        return {"filename": filename, "index": index}
+
+    @app.delete(
+        "/api/products/{product_id}/variations/{variation_id}/ref-material/{index}",
+        status_code=200,
+    )
+    def delete_variation_ref_material(
+        product_id: str,
+        variation_id: str,
+        index: int,
+        request: Request = None,
+    ):
+        """Delete a material/color reference image from a variation."""
+        _get_current_user(request)
+        product = store.get_product(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        variation = None
+        for v in product.variations:
+            if v.id == variation_id:
+                variation = v
+                break
+        if not variation:
+            raise HTTPException(status_code=404, detail="Variation not found")
+
+        var_dir = results_dir / product_id / variation_id
+
+        # Remove image file
+        img_path = var_dir / f"ref_mat_{index}.png"
+        if img_path.exists():
+            img_path.unlink()
+
+        # Update materials_meta.json
+        import json as _json
+        meta_path = var_dir / "materials_meta.json"
+        if meta_path.exists():
+            meta_list = _json.loads(meta_path.read_text())
+            meta_list = [e for e in meta_list if e["index"] != index]
+            if meta_list:
+                meta_path.write_text(_json.dumps(meta_list, indent=2))
+            else:
+                meta_path.unlink()
+
+        return {"deleted": index}
 
     @app.post(
         "/api/products/{product_id}/variations/from-result",
@@ -1868,15 +2069,20 @@ def create_app(
         foot: str = "right",
         single: bool = False,
         selected_angles: list[str] | None = None,
+        judged: bool = True,
         user_id: str = "",
     ) -> None:
         """Background thread: generates all camera angles from the hero image."""
         try:
-            import io
             from concurrent.futures import ThreadPoolExecutor, as_completed
             from PIL import Image as PILImage
             from google import genai
-            from google.genai import types as genai_types
+
+            from workflows.shoe_angles.pipeline import (
+                generate_angle,
+                generate_angle_with_judge,
+                get_canonical_angles,
+            )
 
             job_manager.update_progress(job_id, 0.05, "Loading images...")
 
@@ -1907,51 +2113,70 @@ def create_app(
 
             job_manager.update_progress(job_id, 0.1, "Generating angles...")
 
-            # Import angle generation functions
-            import sys as _sys
-            _project_root = Path(__file__).resolve().parent.parent.parent.parent
-            _angles_script = _project_root / "tests"
-            if str(_angles_script) not in _sys.path:
-                _sys.path.insert(0, str(_angles_script))
-
-            from run_shoe_angles import (
-                generate_angle,
-                CANONICAL_ANGLES,
-            )
-
             client = genai.Client()
             generated_images: dict[str, PILImage.Image] = {}
 
-            angles_to_generate = selected_angles if selected_angles is not None else list(CANONICAL_ANGLES)
+            canonical = get_canonical_angles()
+            angles_to_generate = selected_angles if selected_angles is not None else canonical
 
             total = len(angles_to_generate)
             done = 0
 
-            def _gen_angle(angle: str) -> tuple[str, PILImage.Image | None]:
-                try:
-                    if job_manager.is_cancelled(job_id):
-                        return angle, None
-                    _, img, _usage = generate_angle(client, sketch, reference, angle, foot, single=single)
-                    return angle, img
-                except Exception:
-                    return angle, None
+            if judged:
+                # Judged mode: sequential with 3 parallel judges per angle
+                output_dir = var_results_dir / "_angle_judge_logs"
+                output_dir.mkdir(parents=True, exist_ok=True)
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {pool.submit(_gen_angle, a): a for a in angles_to_generate}
-                for fut in as_completed(futures):
-                    angle, img = fut.result()
-                    done += 1
-                    if img is not None:
+                for angle in angles_to_generate:
+                    if job_manager.is_cancelled(job_id):
+                        break
+                    try:
+                        _, img, cost_usd = generate_angle_with_judge(
+                            client, sketch, reference, angle, foot, single=single,
+                            output_dir=output_dir,
+                        )
                         generated_images[angle] = img
-                        fname = f"{angle.replace('/', '_')}.png"
+                        prefix = "single_" if single else ""
+                        fname = f"{prefix}{angle.replace('/', '_')}.png"
                         img.save(var_results_dir / fname)
                         _log_cost(user_id=user_id, operation="angles", model="gemini-3.1-flash-image-preview",
-                                  product_id=product.id, variation_id=variation.id, cost_usd=0.0)
+                                  product_id=product.id, variation_id=variation.id, cost_usd=cost_usd)
+                    except Exception:
+                        pass
+                    done += 1
                     job_manager.update_progress(
                         job_id,
                         0.1 + 0.7 * (done / total),
-                        f"Generated {done}/{total} angles...",
+                        f"Generated {done}/{total} angles (judged)...",
                     )
+            else:
+                # Fast mode: parallel generation without judges
+                def _gen_angle(angle: str) -> tuple[str, PILImage.Image | None]:
+                    try:
+                        if job_manager.is_cancelled(job_id):
+                            return angle, None
+                        _, img, _usage = generate_angle(client, sketch, reference, angle, foot, single=single)
+                        return angle, img
+                    except Exception:
+                        return angle, None
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = {pool.submit(_gen_angle, a): a for a in angles_to_generate}
+                    for fut in as_completed(futures):
+                        angle, img = fut.result()
+                        done += 1
+                        if img is not None:
+                            generated_images[angle] = img
+                            prefix = "single_" if single else ""
+                            fname = f"{prefix}{angle.replace('/', '_')}.png"
+                            img.save(var_results_dir / fname)
+                            _log_cost(user_id=user_id, operation="angles", model="gemini-3.1-flash-image-preview",
+                                      product_id=product.id, variation_id=variation.id, cost_usd=0.0)
+                        job_manager.update_progress(
+                            job_id,
+                            0.1 + 0.7 * (done / total),
+                            f"Generated {done}/{total} angles...",
+                        )
 
             if job_manager.is_cancelled(job_id):
                 return
@@ -1964,7 +2189,8 @@ def create_app(
                 result_files.append(rf)
             # Add all new angle images
             for angle in angles_to_generate:
-                fname = f"{angle.replace('/', '_')}.png"
+                prefix = "single_" if single else ""
+                fname = f"{prefix}{angle.replace('/', '_')}.png"
                 if (var_results_dir / fname).exists():
                     result_files.append(ResultFile(filename=fname))
 
@@ -1988,6 +2214,7 @@ def create_app(
         foot: str = Query("right", pattern="^(left|right)$"),
         single: bool = Query(False),
         angles: list[str] = Query(None, alias="angle"),
+        judged: bool = Query(True),
         request: Request = None,
     ) -> dict:
         user = _get_current_user(request)
@@ -2013,7 +2240,7 @@ def create_app(
         thread = threading.Thread(
             target=_run_generate_angles,
             args=(product, variation, job_id),
-            kwargs={"foot": foot, "single": single, "selected_angles": angles, "user_id": user.id},
+            kwargs={"foot": foot, "single": single, "selected_angles": angles, "judged": judged, "user_id": user.id},
             daemon=True,
         )
         thread.start()
@@ -2677,6 +2904,7 @@ def create_app(
         product_id: str,
         variation_id: str,
         model_photo: UploadFile = fastapi.File(...),
+        mode: str = Query("fast", pattern="^(fast|quality)$"),
         request: Request = None,
     ) -> dict:
         user = _get_current_user(request)
@@ -2694,7 +2922,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_try_on,
-            args=(product, variation, job_id, photo_path, user.id),
+            args=(product, variation, job_id, photo_path, user.id, mode),
             daemon=True,
         )
         thread.start()
@@ -2706,6 +2934,7 @@ def create_app(
         jid: str,
         photo_path: Path,
         user_id: str = "",
+        mode: str = "fast",
     ) -> None:
         try:
             from PIL import Image as PILImage
@@ -2716,23 +2945,79 @@ def create_app(
             shoe_path = results_dir / prod.id / var.id / var.results[0].filename
             shoe_img = PILImage.open(shoe_path).convert("RGB")
 
-            job_manager.update_progress(jid, 0.2, "Generating try-on with Gemini...")
+            if mode == "quality":
+                # Quality mode: agentic loop with judge (3 iterations max)
+                from casadei import ImageMedia, LoggedPipeline
+                from workflows.shoe_tryon_gemini.pipeline import (
+                    build_pipeline as build_tryon_pipeline,
+                    VLMSession,
+                    extract_features,
+                )
 
-            desc = f"{var.material} {var.color}".strip() or "the shoe"
-            prompt = (
-                f"Replace the shoes the model is wearing with {desc} shown in the "
-                f"second image. Keep the model's pose, outfit, and background exactly "
-                f"the same. Only change the shoes. The result should look like a natural "
-                f"fashion photograph. Photorealistic, high quality."
-            )
+                job_manager.update_progress(jid, 0.15, "Extracting shoe features...")
 
-            img_bytes, usage = _gemini_edit([model_img, shoe_img], prompt)
+                vlm_session = VLMSession("gemini_flash_lite")
+                try:
+                    shoe_media = ImageMedia(image=shoe_img)
+                    features = extract_features(vlm_session, shoe_media)
 
-            cost = calculate_cost("gemini-3.1-flash-image-preview", usage)
-            _log_cost(user_id=user_id, operation="try_on", model="gemini-3.1-flash-image-preview",
-                      product_id=prod.id, variation_id=var.id,
-                      input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
-                      thinking_tokens=usage.get("thinking_tokens", 0), cost_usd=cost)
+                    job_manager.update_progress(jid, 0.2, "Running quality try-on loop...")
+
+                    pipeline, edit_agent = build_tryon_pipeline(
+                        max_iterations=3,
+                        vlm_session=vlm_session,
+                        features=features,
+                        tolerance="moderate",
+                    )
+                    logged = LoggedPipeline(pipeline)
+                    person_media = ImageMedia(image=model_img)
+                    context = {
+                        "person": person_media,
+                        "shoe": shoe_media,
+                        "image": person_media,
+                    }
+                    result, exec_log = logged.run(context)
+                finally:
+                    vlm_session.unload()
+
+                final_img = result.get("image")
+                if final_img is not None and isinstance(final_img, ImageMedia):
+                    import io as _io
+                    buf = _io.BytesIO()
+                    final_img.image.save(buf, format="PNG")
+                    img_bytes = buf.getvalue()
+                else:
+                    job_manager.fail(jid, "Quality try-on produced no image")
+                    return
+
+                # Log costs
+                token_records = vlm_session.token_usage_log + edit_agent.token_usage_log
+                for usage_entry in token_records:
+                    cost = calculate_cost(usage_entry.get("model", ""), usage_entry)
+                    _log_cost(user_id=user_id, operation="try_on", model=usage_entry.get("model", ""),
+                              product_id=prod.id, variation_id=var.id,
+                              input_tokens=usage_entry.get("input_tokens", 0),
+                              output_tokens=usage_entry.get("output_tokens", 0),
+                              thinking_tokens=usage_entry.get("thinking_tokens", 0), cost_usd=cost)
+            else:
+                # Fast mode: single-call Gemini edit (no loop, no judge)
+                job_manager.update_progress(jid, 0.2, "Generating try-on with Gemini...")
+
+                desc = f"{var.material} {var.color}".strip() or "the shoe"
+                prompt = (
+                    f"Replace the shoes the model is wearing with {desc} shown in the "
+                    f"second image. Keep the model's pose, outfit, and background exactly "
+                    f"the same. Only change the shoes. The result should look like a natural "
+                    f"fashion photograph. Photorealistic, high quality."
+                )
+
+                img_bytes, usage = _gemini_edit([model_img, shoe_img], prompt)
+
+                cost = calculate_cost("gemini-3.1-flash-image-preview", usage)
+                _log_cost(user_id=user_id, operation="try_on", model="gemini-3.1-flash-image-preview",
+                          product_id=prod.id, variation_id=var.id,
+                          input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
+                          thinking_tokens=usage.get("thinking_tokens", 0), cost_usd=cost)
 
             job_manager.update_progress(jid, 0.9, "Saving result...")
             _save_gemini_result(prod, var, img_bytes, "try-on", "gemini_tryon")
@@ -2756,6 +3041,7 @@ def create_app(
         variation_id: str,
         scene: str = fastapi.Query(...),
         prompt: str = fastapi.Query(""),
+        source: str = fastapi.Query(""),
         request: Request = None,
     ) -> dict:
         user = _get_current_user(request)
@@ -2767,7 +3053,7 @@ def create_app(
 
         thread = threading.Thread(
             target=_run_create_context,
-            args=(product, variation, job_id, scene, prompt, user.id),
+            args=(product, variation, job_id, scene, prompt, source, user.id),
             daemon=True,
         )
         thread.start()
@@ -2779,6 +3065,7 @@ def create_app(
         jid: str,
         scene: str,
         extra_prompt: str,
+        source_filename: str = "",
         user_id: str = "",
     ) -> None:
         try:
@@ -2786,8 +3073,15 @@ def create_app(
 
             job_manager.update_progress(jid, 0.1, "Loading shoe image...")
 
-            shoe_path = results_dir / prod.id / var.id / var.results[0].filename
+            # Use selected source or fall back to first result
+            src = source_filename or var.results[0].filename
+            shoe_path = results_dir / prod.id / var.id / src
+            if not shoe_path.exists():
+                shoe_path = results_dir / prod.id / var.id / var.results[0].filename
             shoe_img = PILImage.open(shoe_path).convert("RGB")
+
+            # Detect if source is a single shoe or a pair
+            is_single = src.startswith("single_")
 
             job_manager.update_progress(jid, 0.2, f"Creating {scene} scene with Gemini...")
 
@@ -2802,12 +3096,22 @@ def create_app(
             scene_desc = SCENE_PROMPTS.get(scene, scene)
 
             desc = f"{var.material} {var.color}".strip() or "this luxury shoe"
-            prompt = (
-                f"Place {desc} {scene_desc}. "
-                f"Create a professional lifestyle product photograph. "
-                f"The shoe must be the hero of the image, clearly visible and in focus. "
-                f"Photorealistic, editorial quality, beautiful composition."
-            )
+            if is_single:
+                prompt = (
+                    f"Place this single {desc} shoe {scene_desc}. "
+                    f"Create a professional lifestyle product photograph. "
+                    f"The shoe must be the hero of the image, clearly visible and in focus. "
+                    f"Show only one shoe, elegantly positioned. "
+                    f"Photorealistic, editorial quality, beautiful composition."
+                )
+            else:
+                prompt = (
+                    f"Place this pair of {desc} shoes {scene_desc}. "
+                    f"Create a professional lifestyle product photograph. "
+                    f"The pair of shoes must be the hero of the image, clearly visible and in focus. "
+                    f"Keep both shoes together as a pair. "
+                    f"Photorealistic, editorial quality, beautiful composition."
+                )
             if extra_prompt:
                 prompt += f" {extra_prompt}"
 
@@ -3006,6 +3310,12 @@ def create_app(
                 status_code=404, detail="Variation not found"
             )
         store.save_product(product)
+
+        # Clean up result files on disk
+        import shutil
+        var_dir = results_dir / product_id / variation_id
+        if var_dir.exists():
+            shutil.rmtree(var_dir, ignore_errors=True)
 
     @app.delete(
         "/api/products/{product_id}/variations/{variation_id}/results/{filename}",
