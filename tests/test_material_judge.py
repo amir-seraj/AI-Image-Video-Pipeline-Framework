@@ -116,3 +116,170 @@ def test_text_mode_no_grid_image():
     call_args = model.run.call_args
     bundle = call_args[0][0]
     assert "material_ref" not in bundle.items
+
+
+# ---------------------------------------------------------------------------
+# Image mode tests
+# ---------------------------------------------------------------------------
+
+def test_single_image_mode_accept():
+    """Image mode with single material: grid_image provided, no material_names."""
+    result_json = _MaterialJudgeResult(
+        observation="Material matches the swatch — brown leather",
+        score=5,
+        repair="none",
+    ).model_dump_json()
+
+    session, model = _mock_vlm_text_mode(result_json)
+    grid = ImageMedia(image=PILImage.new("RGB", (500, 530), (200, 150, 100)))
+    judge = make_material_judge(
+        session=session,
+        material_spec="Apply the material shown in the reference image to the shoe.",
+        grid_image=grid,
+        material_names=None,
+        tolerance="generous",
+    )
+    ctx = {"image": _make_candidate()}
+    accepted, feedback = judge(ctx)
+    assert accepted is True
+    # Bundle should contain material_ref
+    call_args = model.run.call_args
+    bundle = call_args[0][0]
+    assert "material_ref" in bundle.items
+
+
+def test_single_image_mode_with_one_name():
+    """Image mode with material_names=["Suede A"] -> still single mode (len <= 1)."""
+    result_json = _MaterialJudgeResult(
+        observation="Suede matches", score=4, repair="none",
+    ).model_dump_json()
+    session, model = _mock_vlm_text_mode(result_json)
+    grid = ImageMedia(image=PILImage.new("RGB", (500, 530), (200, 150, 100)))
+    judge = make_material_judge(
+        session=session,
+        material_spec="Apply the material shown in the reference image to the shoe.",
+        grid_image=grid,
+        material_names=["Suede A"],
+        tolerance="generous",
+    )
+    ctx = {"image": _make_candidate()}
+    accepted, _ = judge(ctx)
+    assert accepted is True
+    # Metadata should have single "material" key, not per-name keys
+    meta = ctx["_judge_metadata_material"]
+    assert "material" in meta["scores"]
+
+
+def test_multi_image_mode_accept():
+    """Multi-material image mode: grid_image + len(material_names) > 1."""
+    result_json = _SpecJudgeResult(
+        observations={
+            "Suede_A_match": "Brown suede matches swatch",
+            "Suede_A_placement": "Applied to upper correctly",
+            "Color_1_match": "Red matches swatch",
+            "Color_1_placement": "Applied to heel correctly",
+        },
+        scores={
+            "Suede_A_match": 5,
+            "Suede_A_placement": 4,
+            "Color_1_match": 5,
+            "Color_1_placement": 5,
+        },
+        repair="none",
+    ).model_dump_json()
+
+    session, model = _mock_vlm_text_mode(result_json)
+    grid = ImageMedia(image=PILImage.new("RGB", (1000, 530), (200, 150, 100)))
+    judge = make_material_judge(
+        session=session,
+        material_spec="Apply Suede A to upper, Color 1 to heel.",
+        grid_image=grid,
+        material_names=["Suede A", "Color 1"],
+        tolerance="generous",
+    )
+    ctx = {"image": _make_candidate()}
+    accepted, feedback = judge(ctx)
+    assert accepted is True
+    meta = ctx["_judge_metadata_material"]
+    assert "Suede_A_match" in meta["scores"]
+    assert "Color_1_placement" in meta["scores"]
+
+
+def test_multi_image_mode_reject():
+    """Multi-material: one score below min_floor -> reject."""
+    result_json = _SpecJudgeResult(
+        observations={
+            "Suede_A_match": "Wrong material", "Suede_A_placement": "Wrong spot",
+            "Color_1_match": "Good", "Color_1_placement": "Good",
+        },
+        scores={
+            "Suede_A_match": 1, "Suede_A_placement": 2,
+            "Color_1_match": 5, "Color_1_placement": 5,
+        },
+        repair="Suede A is completely wrong — use brown suede on the upper.",
+    ).model_dump_json()
+    session, model = _mock_vlm_text_mode(result_json)
+    grid = ImageMedia(image=PILImage.new("RGB", (1000, 530), (200, 150, 100)))
+    judge = make_material_judge(
+        session=session,
+        material_spec="Apply Suede A to upper, Color 1 to heel.",
+        grid_image=grid,
+        material_names=["Suede A", "Color 1"],
+        tolerance="moderate",
+    )
+    ctx = {"image": _make_candidate()}
+    accepted, feedback = judge(ctx)
+    assert accepted is False
+    assert "Suede" in feedback
+
+
+# ---------------------------------------------------------------------------
+# Edge case tests
+# ---------------------------------------------------------------------------
+
+def test_hash_dedup_auto_accepts():
+    """Same image called twice -> second call auto-accepts without VLM call."""
+    result_json = _MaterialJudgeResult(
+        observation="ok", score=4, repair="none",
+    ).model_dump_json()
+    session, model = _mock_vlm_text_mode(result_json)
+    judge = make_material_judge(
+        session=session,
+        material_spec="red leather",
+        grid_image=None,
+        tolerance="generous",
+    )
+    candidate = _make_candidate()
+    ctx1 = {"image": candidate}
+    judge(ctx1)
+    assert model.run.call_count == 1
+
+    # Same image again
+    ctx2 = {"image": candidate}
+    accepted, feedback = judge(ctx2)
+    assert accepted is True
+    assert feedback == "none"
+    assert model.run.call_count == 1  # No second VLM call
+
+
+def test_parse_failure_returns_rejection():
+    """VLM returns garbage -> graceful rejection, not crash."""
+    session, model = _mock_vlm_text_mode("not valid json at all")
+    judge = make_material_judge(
+        session=session,
+        material_spec="red leather",
+        grid_image=None,
+        tolerance="generous",
+    )
+    ctx = {"image": _make_candidate()}
+    accepted, feedback = judge(ctx)
+    assert accepted is False
+    assert "parse error" in feedback.lower()
+
+
+def test_empty_material_spec_raises():
+    """material_spec="" should raise ValueError."""
+    import pytest
+    session = MagicMock()
+    with pytest.raises(ValueError, match="non-empty"):
+        make_material_judge(session=session, material_spec="")
