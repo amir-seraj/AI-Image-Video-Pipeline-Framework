@@ -1726,40 +1726,48 @@ def create_app(
                                   output_tokens=usage_entry.get("output_tokens", 0),
                                   thinking_tokens=usage_entry.get("thinking_tokens", 0), cost_usd=cost)
 
-                # Extract the final image from this run
-                run_img = result.get("image")
-                if run_img is None or not isinstance(run_img, ImageMedia):
-                    continue
-
-                # Extract score from the loop history
-                score = 0.0
-                accepted = False
-                feedback = ""
+                # Save ALL iteration images as candidates
                 loop_history = result.get("angle_correction_loop_history")
                 if isinstance(loop_history, _LoopResult) and loop_history.iterations:
-                    # Use the last iteration's metadata (the accepted/best one)
-                    last_it = loop_history.iterations[-1]
-                    spec_avg = last_it.metadata.get("spec_avg") or 0.0
-                    sketch_avg = last_it.metadata.get("sketch_avg") or 0.0
-                    score = (spec_avg + sketch_avg) / 2.0 if (spec_avg or sketch_avg) else 0.0
-                    accepted = last_it.accepted
-                    feedback = last_it.feedback[:200]
+                    for it in loop_history.iterations:
+                        it_img = it.outputs.get("image")
+                        if it_img is None or not isinstance(it_img, ImageMedia):
+                            continue
+                        spec_avg = it.metadata.get("spec_avg") or 0.0
+                        sketch_avg = it.metadata.get("sketch_avg") or 0.0
+                        it_score = (spec_avg + sketch_avg) / 2.0 if (spec_avg or sketch_avg) else 0.0
 
-                # Save candidate
-                c_fname = f"hero_candidate_{run_idx}.png"
-                run_img.image.save(var_results_dir / c_fname)
-                candidates.append(HeroCandidate(
-                    filename=c_fname,
-                    iteration=run_idx,
-                    accepted=accepted,
-                    score=round(score, 3),
-                    feedback=feedback,
-                    selected=False,
-                ))
+                        c_fname = f"hero_candidate_{run_idx}_{it.index}.png"
+                        it_img.image.save(var_results_dir / c_fname)
+                        candidates.append(HeroCandidate(
+                            filename=c_fname,
+                            iteration=run_idx,
+                            accepted=it.accepted,
+                            score=round(it_score, 3),
+                            feedback=it.feedback[:200],
+                            selected=False,
+                        ))
 
-                if score > best_score:
-                    best_score = score
-                    best_candidate_idx = len(candidates) - 1
+                        if it_score > best_score:
+                            best_score = it_score
+                            best_candidate_idx = len(candidates) - 1
+                else:
+                    # Fallback: save just the final image if no loop history
+                    run_img = result.get("image")
+                    if run_img is None or not isinstance(run_img, ImageMedia):
+                        continue
+                    c_fname = f"hero_candidate_{run_idx}.png"
+                    run_img.image.save(var_results_dir / c_fname)
+                    candidates.append(HeroCandidate(
+                        filename=c_fname,
+                        iteration=run_idx,
+                        accepted=False,
+                        score=0.0,
+                        feedback="",
+                        selected=False,
+                    ))
+                    if 0.0 > best_score:
+                        best_candidate_idx = len(candidates) - 1
 
             if not candidates:
                 job_manager.fail(job_id, "All generation runs produced no output")
