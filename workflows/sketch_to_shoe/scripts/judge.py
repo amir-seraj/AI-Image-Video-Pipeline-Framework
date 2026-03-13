@@ -28,7 +28,7 @@ from casadei.media import ImageMedia, Media, TextMedia, MediaBundle
 TOLERANCE_CONFIGS = {
     "generous":  {"avg_threshold": 3.0, "min_floor": 2.0},
     "moderate":  {"avg_threshold": 3.5, "min_floor": 2.5},
-    "strict":    {"avg_threshold": 4.5, "min_floor": 4.0},
+    "strict":    {"avg_threshold": 4.0, "min_floor": 3.5},
 }
 
 _MAX_RETRIES = 3
