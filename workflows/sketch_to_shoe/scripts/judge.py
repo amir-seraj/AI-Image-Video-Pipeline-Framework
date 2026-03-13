@@ -939,6 +939,212 @@ def make_shoe_count_judge(
 
 
 # ---------------------------------------------------------------------------
+# Material Compliance Judge
+# ---------------------------------------------------------------------------
+
+_MATERIAL_TEXT_PROMPT = """\
+You are a material inspector for a luxury shoe studio. The shoe should be made of: {material_spec}.
+
+Examine the generated shoe and score how well the visible material, color, and finish match the specification.
+
+STEP 1 — OBSERVE: Describe the material, color, and finish you see on the shoe.
+STEP 2 — SCORE: Rate material compliance 1-5 (1=completely wrong material/color, \
+2=fundamentally different, 3=partially correct with clear discrepancy, \
+4=substantially matches with minor variation, 5=precise match).
+STEP 3 — REPAIR: For score 3 or below, state the flaw and give a concrete \
+material/color fix instruction. For 4-5, write "none".
+"""
+
+_MATERIAL_IMAGE_SINGLE_PROMPT = """\
+You are a material inspector for a luxury shoe studio. You are given two images:
+- SHOE IMAGE: a generated photorealistic shoe product photo.
+- MATERIAL REFERENCE: a labeled material/color swatch that should be applied to the shoe.
+
+The generator was instructed: {material_spec}
+
+Examine the SHOE IMAGE and verify that the material/color from the MATERIAL REFERENCE \
+has been correctly applied to the shoe.
+
+STEP 1 — OBSERVE: Describe the material/color in the MATERIAL REFERENCE. \
+Then describe what you see on the shoe in the SHOE IMAGE.
+STEP 2 — SCORE: Rate how well the SHOE IMAGE matches the MATERIAL REFERENCE (1-5).
+STEP 3 — REPAIR: For score 3 or below, state the discrepancy and give a concrete fix. \
+For 4-5, write "none".
+"""
+
+_MATERIAL_IMAGE_MULTI_PROMPT = """\
+You are a material inspector for a luxury shoe studio. You are given two images:
+- SHOE IMAGE: a generated photorealistic shoe product photo.
+- MATERIAL REFERENCE: labeled material/color swatches with names. Each should be applied \
+to a specific part of the shoe as described below.
+
+The generator was instructed:
+{material_spec}
+
+Examine the SHOE IMAGE and verify that each material/color from the MATERIAL REFERENCE \
+has been correctly applied to the correct part of the shoe.
+
+STEP 1 — OBSERVE: For each material listed, describe what the MATERIAL REFERENCE shows \
+for that swatch, then describe what you see on that part of the shoe in the SHOE IMAGE.
+STEP 2 — SCORE: Rate each material on two aspects. Use these exact attribute names:
+{score_attributes}
+Score each 1-5 (1=completely wrong, 5=precise match).
+STEP 3 — REPAIR: For any attribute scored 3 or below, state which material on which part \
+is wrong and give a concrete fix. For all 4-5, write "none".
+"""
+
+
+def make_material_judge(
+    session: VLMSession,
+    material_spec: str,
+    grid_image: ImageMedia | None = None,
+    material_names: list[str] | None = None,
+    candidate_key: str = "image",
+    tolerance: str = "moderate",
+) -> JudgeCallable:
+    """Return a JudgeCallable that verifies material compliance.
+
+    Mode selection:
+    - grid_image is None -> text mode (single score)
+    - grid_image provided, material_names is None or len <= 1 -> single-image mode (single score)
+    - grid_image provided, len(material_names) > 1 -> multi-material image mode (per-material scores)
+    """
+    if not material_spec:
+        raise ValueError("material_spec must be non-empty")
+
+    tol = TOLERANCE_CONFIGS.get(tolerance, TOLERANCE_CONFIGS["moderate"])
+    avg_threshold = tol["avg_threshold"]
+    min_floor = tol["min_floor"]
+
+    _prev_candidate_hash: list[str | None] = [None]
+
+    # Determine mode
+    is_multi = (
+        grid_image is not None
+        and material_names is not None
+        and len(material_names) > 1
+    )
+    is_image = grid_image is not None
+
+    # Build score attributes for multi-material mode
+    if is_multi:
+        score_attributes = []
+        for name in material_names:
+            sanitized = name.replace(" ", "_")
+            score_attributes.append(f"{sanitized}_match")
+            score_attributes.append(f"{sanitized}_placement")
+    else:
+        score_attributes = []
+
+    def judge(context: dict[str, Media]) -> tuple[bool, str]:
+        candidate = context.get(candidate_key)
+        if not isinstance(candidate, ImageMedia):
+            return False, f"Missing candidate image (key='{candidate_key}')."
+
+        current_hash = _image_hash(candidate)
+        if _prev_candidate_hash[0] is not None and current_hash == _prev_candidate_hash[0]:
+            print("  [Material Judge] Image unchanged — auto-accepting (no token spend)")
+            return True, "none"
+        _prev_candidate_hash[0] = current_hash
+
+        # --- Build prompt and bundle based on mode ---
+        if is_multi:
+            prompt_text = _MATERIAL_IMAGE_MULTI_PROMPT.format(
+                material_spec=material_spec,
+                score_attributes=", ".join(score_attributes),
+            )
+            bundle = MediaBundle(items={
+                "candidate": candidate,
+                "material_ref": grid_image,
+                "prompt": TextMedia(text=prompt_text),
+            })
+            schema = _SpecJudgeResult.model_json_schema()
+        elif is_image:
+            prompt_text = _MATERIAL_IMAGE_SINGLE_PROMPT.format(
+                material_spec=material_spec,
+            )
+            bundle = MediaBundle(items={
+                "candidate": candidate,
+                "material_ref": grid_image,
+                "prompt": TextMedia(text=prompt_text),
+            })
+            schema = _MaterialJudgeResult.model_json_schema()
+        else:
+            prompt_text = _MATERIAL_TEXT_PROMPT.format(
+                material_spec=material_spec,
+            )
+            bundle = MediaBundle(items={
+                "candidate": candidate,
+                "prompt": TextMedia(text=prompt_text),
+            })
+            schema = _MaterialJudgeResult.model_json_schema()
+
+        # --- Call VLM ---
+        model = session.acquire()
+        try:
+            raw_json = _call_vlm_structured(
+                model, bundle,
+                schema=schema,
+                label="Material Judge",
+            )
+            session.record_usage("Material Judge")
+
+            # --- Parse and score ---
+            if is_multi:
+                try:
+                    parsed = _SpecJudgeResult.model_validate_json(raw_json)
+                except Exception:
+                    return False, "Material judge parse error — regenerate with the specified materials."
+
+                scores = {k: float(v) for k, v in parsed.scores.items()}
+                repair = parsed.repair
+                avg = sum(scores.values()) / len(scores) if scores else 0.0
+                lowest_val = min(scores.values()) if scores else 0.0
+                accepted = avg >= avg_threshold and lowest_val >= min_floor
+
+                context["_judge_metadata_material"] = {
+                    "scores": scores,
+                    "avg_score": round(avg, 2),
+                    "lowest_score": round(lowest_val, 2),
+                }
+
+                verdict = "ACCEPT" if accepted else "REJECT"
+                scores_str = ", ".join(f"{k}={v}" for k, v in scores.items())
+                print(f"  [Material Judge {verdict}] avg={avg:.1f} min={lowest_val:.1f} "
+                      f"(threshold: avg>={avg_threshold}, min>={min_floor})")
+                print(f"  Scores: {scores_str}")
+                if not accepted:
+                    print(f"  Repair: {repair}")
+                return accepted, repair
+            else:
+                try:
+                    parsed = _MaterialJudgeResult.model_validate_json(raw_json)
+                except Exception:
+                    return False, "Material judge parse error — regenerate with the specified materials."
+
+                score = float(parsed.score)
+                repair = parsed.repair
+                accepted = score >= avg_threshold and score >= min_floor
+
+                context["_judge_metadata_material"] = {
+                    "scores": {"material": score},
+                    "avg_score": round(score, 2),
+                    "lowest_score": round(score, 2),
+                }
+
+                verdict = "ACCEPT" if accepted else "REJECT"
+                print(f"  [Material Judge {verdict}] score={score:.1f} "
+                      f"(threshold: avg>={avg_threshold}, min>={min_floor})")
+                if not accepted:
+                    print(f"  Repair: {repair}")
+                return accepted, repair
+        finally:
+            session.release()
+
+    return judge
+
+
+# ---------------------------------------------------------------------------
 # Dual Judge Combiner
 # ---------------------------------------------------------------------------
 
