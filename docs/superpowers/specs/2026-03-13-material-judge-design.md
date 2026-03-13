@@ -17,7 +17,7 @@ def make_material_judge(
     grid_image: ImageMedia | None = None,
     material_names: list[str] | None = None,
     candidate_key: str = "image",
-    tolerance: str = "generous",
+    tolerance: str = "moderate",
 ) -> JudgeCallable
 ```
 
@@ -25,7 +25,7 @@ def make_material_judge(
 - `material_spec` — text mode: the material description string (e.g. "red leather"); image mode: the `materials_instructions` text from `build_materials_prompt()` (includes names, placements, notes)
 - `grid_image` — `None` for text mode; the grid `ImageMedia` for image mode. Presence auto-detects text vs image mode.
 - `material_names` — `None` for text mode and single-image mode. For multi-material image mode: the list of resolved names (e.g. `["Suede A", "Color 1"]`). When provided and `len > 1`, enables placement verification. This is explicit — no string-heuristic detection.
-- `tolerance` — reuses existing `TOLERANCE_CONFIGS` ("generous", "moderate", "strict")
+- `tolerance` — reuses existing `TOLERANCE_CONFIGS` ("generous", "moderate", "strict"); defaults to "moderate"
 - `material_spec` must be non-empty.
 
 **Returns:** A `JudgeCallable` that returns `(accepted: bool, repair: str)`.
@@ -186,7 +186,7 @@ material_judge = make_material_judge(
     grid_image=ImageMedia(image=grid_image) if grid_image is not None else None,
     material_names=resolved_names if use_materials_mode and len(materials_list) > 1 else None,
     candidate_key="image",
-    tolerance="generous",
+    tolerance="moderate",
 )
 ```
 
