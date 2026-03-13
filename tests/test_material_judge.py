@@ -283,3 +283,66 @@ def test_empty_material_spec_raises():
     session = MagicMock()
     with pytest.raises(ValueError, match="non-empty"):
         make_material_judge(session=session, material_spec="")
+
+
+# ---------------------------------------------------------------------------
+# best_fn scoring tests
+# ---------------------------------------------------------------------------
+
+from judge import make_best_fn
+from casadei.loop import LoopIteration
+
+
+def test_best_fn_includes_material_avg():
+    """best_fn should factor material_avg into candidate ranking."""
+    session = MagicMock()
+    best_fn = make_best_fn(session=session, output_key="image")
+
+    img_good_camera = _make_candidate()
+    img_good_material = _make_candidate()
+    # Modify the second image so it has a different identity
+    img_good_material.image.putpixel((0, 0), (255, 0, 0))
+
+    history = [
+        LoopIteration(
+            index=0,
+            accepted=False,
+            feedback="camera bad",
+            duration_ms=100.0,
+            outputs={"image": img_good_camera},
+            metadata={"sketch_avg": None, "spec_avg": 5.0, "material_avg": 1.0},
+        ),
+        LoopIteration(
+            index=1,
+            accepted=False,
+            feedback="camera ok-ish",
+            duration_ms=100.0,
+            outputs={"image": img_good_material},
+            metadata={"sketch_avg": None, "spec_avg": 3.0, "material_avg": 5.0},
+        ),
+    ]
+    result = best_fn(history, {})
+    # iter 0: non-zero components = [5.0, 1.0] -> avg = 3.0
+    # iter 1: non-zero components = [3.0, 5.0] -> avg = 4.0
+    # iter 1 should win
+    assert result.get("best_selection_index") == 2  # 1-indexed
+
+
+def test_best_fn_backward_compatible_no_material():
+    """best_fn still works when material_avg is absent (older pipelines)."""
+    session = MagicMock()
+    best_fn = make_best_fn(session=session, output_key="image")
+
+    img = _make_candidate()
+    history = [
+        LoopIteration(
+            index=0,
+            accepted=False,
+            feedback="rejected",
+            duration_ms=100.0,
+            outputs={"image": img},
+            metadata={"sketch_avg": None, "spec_avg": 4.0},
+        ),
+    ]
+    result = best_fn(history, {})
+    assert result.get("best_selection_index") == 1

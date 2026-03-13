@@ -1214,7 +1214,9 @@ def make_best_fn(
                 continue
             sketch_avg = record.metadata.get("sketch_avg") or 0.0
             spec_avg = record.metadata.get("spec_avg") or 0.0
-            combined = (sketch_avg + spec_avg) / 2.0
+            material_avg = record.metadata.get("material_avg") or 0.0
+            components = [v for v in (sketch_avg, spec_avg, material_avg) if v > 0]
+            combined = sum(components) / len(components) if components else 0.0
             candidates.append((i, img, combined))
 
         if not candidates:
