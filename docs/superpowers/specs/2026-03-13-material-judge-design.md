@@ -1,6 +1,6 @@
 # Material Judge Design
 
-Add a material compliance judge to the sketch-to-shoe Gemini pipeline. The judge verifies that generated shoes use the correct materials/colors. Operates in two modes (text and image) matching the pipeline's two material input modes.
+Add a material compliance judge to the sketch-to-shoe Gemini pipeline. The judge verifies that generated shoes use the correct materials/colors. Operates in three modes — text, single-image, and multi-material image — matching the pipeline's material input modes.
 
 ## Overview
 
@@ -170,7 +170,7 @@ Extract the default material to a shared constant in `pipeline.py`:
 DEFAULT_MATERIAL = "black patent leather"
 ```
 
-Used in both `template_kwargs` and the material judge construction.
+Used in both `template_kwargs` (replacing the existing hardcoded `"black patent leather"` string) and the material judge construction.
 
 ### `_combined_judge` Changes in `pipeline.py`
 
@@ -246,6 +246,23 @@ def _combined_judge(context):
     return accepted, "\n".join(parts) if parts else "none"
 ```
 
+### `best_fn` Scoring Update
+
+The existing `make_best_fn` ranks candidates by `(sketch_avg + spec_avg) / 2.0`. Since `sketch_avg` is always `None` in this pipeline, only camera scores drive selection. With the new material judge, `best_fn` must also factor in `material_avg`:
+
+```python
+sketch_avg = record.metadata.get("sketch_avg") or 0.0
+spec_avg = record.metadata.get("spec_avg") or 0.0
+material_avg = record.metadata.get("material_avg") or 0.0
+combined = (sketch_avg + spec_avg + material_avg) / 3.0
+```
+
+This is a one-line change in `make_best_fn` inside `judge.py`. When `material_avg` is absent (e.g. older pipelines not passing it), it falls back to `0.0` — same behavior as `sketch_avg` today. No breaking change.
+
+### `save_results` Note
+
+`save_results` in `pipeline.py` currently logs `camera_score` and `spec_avg` from iteration metadata. The new `material_scores` and `material_avg` fields will also be available in `_judge_metadata` but capturing them in `save_results` is NOT required for this task — it's a nice-to-have that can be added later.
+
 ### Return Type
 
 `build_pipeline` return type and the VLM sessions list are updated to include `session_material`:
@@ -258,7 +275,7 @@ return (pipeline, gemini_agent,
 
 ## What Does NOT Change
 
-- `judge.py` existing judges (`make_spec_judge`, `make_sketch_judge`, `make_shoe_count_judge`, etc.) — untouched
+- `judge.py` existing judges (`make_spec_judge`, `make_sketch_judge`, `make_shoe_count_judge`, etc.) — untouched except `make_best_fn` scoring formula (one-line addition)
 - `build_pipeline` return type signature — already `tuple[Pipeline, Agent, list[VLMSession], PILImage.Image | None]`
 - `app.py` — no changes needed; it already passes the sessions list through
 - `image_utils.py` — no changes
