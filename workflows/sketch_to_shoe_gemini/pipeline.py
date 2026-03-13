@@ -31,7 +31,7 @@ for _p in [str(_SHARED_DIR), str(_JUDGE_DIR)]:
 # ---------------------------------------------------------------------------
 
 from image_utils import get_camera_preset, get_judge_notes, foot_framing, build_sketch_grid, build_material_grid  # noqa: E402
-from judge import VLMSession, make_spec_judge, make_shoe_count_judge, make_best_fn  # noqa: E402
+from judge import VLMSession, make_spec_judge, make_shoe_count_judge, make_material_judge, make_best_fn  # noqa: E402
 
 from casadei import Agent, AgentConfig, AgentStep, ImageMedia, TextMedia, Pipeline  # noqa: E402
 from casadei.loop import LoopStep, LoopResult  # noqa: E402
@@ -124,6 +124,7 @@ def build_materials_prompt(
 # ---------------------------------------------------------------------------
 
 MAX_ITERATIONS = 3
+DEFAULT_MATERIAL = "black patent leather"
 
 
 def build_pipeline(
@@ -215,12 +216,13 @@ def build_pipeline(
             "extra_specs": extra_specs_text,
             "foot_framing": foot_framing(foot, emphatic=False),
             "feedback": "",
-            **({"materials_instructions": materials_instructions} if use_materials_mode else {"material": spec.get("material", "black patent leather")}),
+            **({"materials_instructions": materials_instructions} if use_materials_mode else {"material": spec.get("material", DEFAULT_MATERIAL)}),
         },
     )
 
     session_camera = VLMSession("gemini_flash")
     session_count = VLMSession("gemini_flash_lite")
+    session_material = VLMSession("gemini_flash")
 
     camera_judge = make_spec_judge(
         session=session_camera,
@@ -237,6 +239,15 @@ def build_pipeline(
         candidate_key="image",
     )
 
+    material_judge = make_material_judge(
+        session=session_material,
+        material_spec=materials_instructions if use_materials_mode else spec.get("material", DEFAULT_MATERIAL),
+        grid_image=ImageMedia(image=grid_image) if grid_image is not None else None,
+        material_names=resolved_names if use_materials_mode and len(materials_list) > 1 else None,
+        candidate_key="image",
+        tolerance="moderate",
+    )
+
     def _combined_judge(context):
         image = context.get("image")
         # Force PIL lazy-load before threads start — prevents concurrent load() race
@@ -244,31 +255,40 @@ def build_pipeline(
             image.image.load()
         ctx_cam: dict = {"image": image}
         ctx_count: dict = {"image": image}
+        ctx_material: dict = {"image": image}
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             fut_cam = pool.submit(camera_judge, ctx_cam)
             fut_count = pool.submit(count_judge, ctx_count)
+            fut_material = pool.submit(material_judge, ctx_material)
             cam_accepted, cam_fb = fut_cam.result()
             count_accepted, count_fb = fut_count.result()
+            mat_accepted, mat_fb = fut_material.result()
 
-        # Propagate metadata written by judges back to main context
+        # Propagate metadata from all judges
         context.update({k: v for k, v in ctx_cam.items() if k.startswith("_")})
         context.update({k: v for k, v in ctx_count.items() if k.startswith("_")})
+        context.update({k: v for k, v in ctx_material.items() if k.startswith("_")})
 
-        # Promote camera metadata for best_fn
+        # Promote camera + material metadata for best_fn
         meta = context.pop("_judge_metadata_spec", {})
+        mat_meta = context.pop("_judge_metadata_material", {})
         context["_judge_metadata"] = {
             "sketch_avg": None,
             "spec_scores": meta.get("scores", {}),
             "spec_avg": meta.get("avg_score"),
+            "material_scores": mat_meta.get("scores", {}),
+            "material_avg": mat_meta.get("avg_score"),
         }
-        accepted = cam_accepted and count_accepted
+
+        accepted = cam_accepted and count_accepted and mat_accepted
         parts = []
         if not count_accepted and count_fb and count_fb != "none":
             parts.append(f"Shoe count issue: {count_fb}")
+        if not mat_accepted and mat_fb and mat_fb != "none":
+            parts.append(f"Material issue: {mat_fb}")
         if not cam_accepted and cam_fb and cam_fb != "none":
-            if count_accepted:
-                # Count is fine — protect materials while fixing angle
+            if mat_accepted and count_accepted:
                 parts.append(
                     "CRITICAL: Keep ALL materials, colors, textures, and design elements "
                     "IDENTICAL to the current image — do NOT change any design aspect. "
@@ -291,7 +311,7 @@ def build_pipeline(
         feedback_template_var="feedback",
     )
 
-    return Pipeline(name="sketch_to_shoe_gemini", steps=[loop]), gemini_agent, [session_camera, session_count], grid_image
+    return Pipeline(name="sketch_to_shoe_gemini", steps=[loop]), gemini_agent, [session_camera, session_count, session_material], grid_image
 
 
 # ---------------------------------------------------------------------------

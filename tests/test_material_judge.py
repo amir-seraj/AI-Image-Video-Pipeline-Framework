@@ -346,3 +346,43 @@ def test_best_fn_backward_compatible_no_material():
     ]
     result = best_fn(history, {})
     assert result.get("best_selection_index") == 1
+
+
+# ---------------------------------------------------------------------------
+# Pipeline integration tests
+# ---------------------------------------------------------------------------
+
+from workflows.sketch_to_shoe_gemini.pipeline import DEFAULT_MATERIAL, build_pipeline
+
+
+def test_default_material_constant():
+    assert DEFAULT_MATERIAL == "black patent leather"
+
+
+def test_build_pipeline_returns_three_sessions():
+    """build_pipeline should return 3 VLM sessions (camera, count, material)."""
+    spec = {
+        "material": "red leather",
+        "camera_angle": "3/4",
+        "extra": {},
+    }
+    vlm = MagicMock()
+    pipeline, agent, sessions, grid_img = build_pipeline(spec, vlm, foot="pair")
+    assert len(sessions) == 3
+
+
+def test_build_pipeline_materials_mode_returns_three_sessions():
+    """build_pipeline with materials mode should also return 3 sessions."""
+    spec = {
+        "material": "ignored",
+        "camera_angle": "3/4",
+        "extra": {},
+        "materials": [
+            {"name": "Test Mat", "image": PILImage.new("RGB", (200, 200), (128, 128, 128)),
+             "placement": "toe", "note": None, "is_color": False},
+        ],
+    }
+    vlm = MagicMock()
+    pipeline, agent, sessions, grid_img = build_pipeline(spec, vlm, foot="pair")
+    assert len(sessions) == 3
+    assert grid_img is not None
