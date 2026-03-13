@@ -254,10 +254,11 @@ The existing `make_best_fn` ranks candidates by `(sketch_avg + spec_avg) / 2.0`.
 sketch_avg = record.metadata.get("sketch_avg") or 0.0
 spec_avg = record.metadata.get("spec_avg") or 0.0
 material_avg = record.metadata.get("material_avg") or 0.0
-combined = (sketch_avg + spec_avg + material_avg) / 3.0
+components = [v for v in (sketch_avg, spec_avg, material_avg) if v > 0]
+combined = sum(components) / len(components) if components else 0.0
 ```
 
-This is a one-line change in `make_best_fn` inside `judge.py`. When `material_avg` is absent (e.g. older pipelines not passing it), it falls back to `0.0` — same behavior as `sketch_avg` today. No breaking change.
+Uses only non-zero score components in the divisor. When `material_avg` is absent (e.g. older pipelines), the formula reduces to `(spec_avg) / 1` or `(sketch_avg + spec_avg) / 2` — identical to the current behavior. No breaking change.
 
 ### `save_results` Note
 
