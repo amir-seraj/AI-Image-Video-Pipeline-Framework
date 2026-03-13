@@ -265,6 +265,19 @@ class _ShoeCountResult(BaseModel):
     )
 
 
+class _MaterialJudgeResult(BaseModel):
+    observation: str = Field(
+        description="Describe the material, color, and finish visible on the shoe"
+    )
+    score: int = Field(
+        description="Material compliance score 1-5",
+        ge=1, le=5,
+    )
+    repair: str = Field(
+        description="For score 3 or below: flaw + fix instruction. For 4-5: 'none'"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
