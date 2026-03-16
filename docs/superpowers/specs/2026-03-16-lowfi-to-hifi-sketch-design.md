@@ -74,7 +74,9 @@ negative_prompt: ""
 
 ## Pipeline Construction (`pipeline.py`)
 
-### `build_pipeline(spec) -> tuple[Pipeline, Agent]`
+### `build_pipeline(spec, temperature=0.8) -> tuple[Pipeline, Agent]`
+
+This workflow has its own standalone runner — no shared runner interface to conform to.
 
 1. Check if `spec` contains a `"volume"` key with an image
 2. Load `prompt_with_volume.yaml` or `prompt_sketch_only.yaml` accordingly
@@ -92,14 +94,31 @@ negative_prompt: ""
 4. Build input map dynamically:
    - Sketch only: `{"image": "sketch"}`
    - With volume: `{"image": "sketch", "volume": "volume"}`
-5. Create single `AgentStep` → `Pipeline` (no loop)
-6. Return `(pipeline, agent)`
 
-### `save_results(run_dir, result_context, result_image, spec, total_elapsed)`
+   Note: The Gemini provider flattens all `ImageMedia` values from the `MediaBundle`
+   into a list, so arbitrary key names (like `"volume"`) work — the model receives
+   them as additional image inputs.
+
+5. Create single `AgentStep` with `template_kwargs`:
+   ```python
+   AgentStep(
+       name="generate_hifi_sketch",
+       agent=agent,
+       input_map=input_map,
+       output_map={"image": "image"},
+       template_kwargs={
+           "extra_specs": build_extra_specs_text(spec.get("extra", {})),
+       },
+   )
+   ```
+6. Wrap in `Pipeline`, return `(pipeline, agent)`
+
+### `save_results(run_dir, result_image, spec, total_elapsed, token_records=None)`
 
 Simple result saver:
 - Save result image as `result.png`
 - Save metadata JSON with timestamp, elapsed time, model, spec, mode (with/without volume)
+- Save token usage records if provided (for cost observability)
 - Print summary to stdout
 
 ## What This Workflow Does NOT Have
