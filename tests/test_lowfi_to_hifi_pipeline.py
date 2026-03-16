@@ -67,3 +67,76 @@ class TestBuildPipeline:
         pipeline, agent = build_pipeline(spec)
 
         assert agent.config.params["temperature"] == 0.8
+
+
+class TestSaveResults:
+    def test_saves_result_image(self, tmp_path):
+        from pipeline import save_results
+
+        img = ImageMedia(image=PILImage.new("RGB", (512, 512), "white"))
+        save_results(
+            run_dir=tmp_path / "run1",
+            result_image=img,
+            spec={},
+            total_elapsed=2.5,
+        )
+        assert (tmp_path / "run1" / "result.png").exists()
+        assert (tmp_path / "run1" / "results.json").exists()
+        assert (tmp_path / "run1" / "summary.txt").exists()
+
+    def test_metadata_contains_mode_sketch_only(self, tmp_path):
+        import json
+        from pipeline import save_results
+
+        img = ImageMedia(image=PILImage.new("RGB", (512, 512), "white"))
+        save_results(
+            run_dir=tmp_path / "run2",
+            result_image=img,
+            spec={},
+            total_elapsed=1.0,
+        )
+        data = json.loads((tmp_path / "run2" / "results.json").read_text())
+        assert data["mode"] == "sketch_only"
+
+    def test_metadata_contains_mode_with_volume(self, tmp_path):
+        import json
+        from pipeline import save_results
+
+        img = ImageMedia(image=PILImage.new("RGB", (512, 512), "white"))
+        save_results(
+            run_dir=tmp_path / "run3",
+            result_image=img,
+            spec={"volume": True},
+            total_elapsed=1.0,
+        )
+        data = json.loads((tmp_path / "run3" / "results.json").read_text())
+        assert data["mode"] == "with_volume"
+
+    def test_token_records_saved(self, tmp_path):
+        import json
+        from pipeline import save_results
+
+        img = ImageMedia(image=PILImage.new("RGB", (512, 512), "white"))
+        records = [{"model": "gemini-3.1-flash-image-preview", "input_tokens": 100, "output_tokens": 50, "thinking_tokens": 0, "cached_tokens": 0, "total_tokens": 150}]
+        save_results(
+            run_dir=tmp_path / "run4",
+            result_image=img,
+            spec={},
+            total_elapsed=1.0,
+            token_records=records,
+        )
+        data = json.loads((tmp_path / "run4" / "results.json").read_text())
+        assert "token_usage" in data
+        assert data["token_usage"]["records"] == records
+
+    def test_none_image_no_crash(self, tmp_path):
+        from pipeline import save_results
+
+        save_results(
+            run_dir=tmp_path / "run5",
+            result_image=None,
+            spec={},
+            total_elapsed=0.5,
+        )
+        assert (tmp_path / "run5" / "results.json").exists()
+        assert not (tmp_path / "run5" / "result.png").exists()
