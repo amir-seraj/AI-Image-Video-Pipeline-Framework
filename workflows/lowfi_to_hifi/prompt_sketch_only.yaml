@@ -1,0 +1,14 @@
+prompt_template: |
+  You are given a rough hand-drawn sketch of a shoe design. Study every line,
+  strap, opening, and structural element carefully. Generate a high-fidelity
+  professional pencil sketch of a single shoe that faithfully renders the design.
+
+  Output style: clean black-and-white pencil rendering on off-white paper,
+  professional fashion sketch quality, single shoe, fine line work with shading
+  for depth.
+  $extra_specs
+
+default_params:
+  temperature: 0.8
+
+negative_prompt: ""

@@ -1,0 +1,17 @@
+prompt_template: |
+  You are given two images: a 3D volume showing the shoe's shape and proportions,
+  and a rough hand-drawn sketch showing the design. Study the volume to understand
+  the depth, curves, and structure. Study the sketch to understand every design
+  detail — lines, straps, openings, and structural elements. Generate a
+  high-fidelity professional pencil sketch of a single shoe that combines the 3D
+  understanding from the volume with the design from the sketch.
+
+  Output style: clean black-and-white pencil rendering on off-white paper,
+  professional fashion sketch quality, single shoe, fine line work with shading
+  for depth.
+  $extra_specs
+
+default_params:
+  temperature: 0.8
+
+negative_prompt: ""
