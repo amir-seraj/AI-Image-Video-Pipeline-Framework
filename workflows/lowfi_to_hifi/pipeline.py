@@ -67,6 +67,11 @@ def build_pipeline(
 ) -> tuple[Pipeline, Agent]:
     """Build the lowfi-to-hifi sketch generation pipeline.
 
+    The returned pipeline expects these keys in the run context:
+      - 'sketch': ImageMedia (required) — the low-fidelity hand-drawn sketch
+      - 'volume': ImageMedia (optional) — 3D volume image, included when
+        spec['volume'] is truthy
+
     Args:
         spec: Dict optionally containing 'volume' (truthy = volume image provided)
               and 'extra' (dict of additional spec key-value pairs).
@@ -130,9 +135,11 @@ def save_results(
 
     has_volume = bool(spec.get("volume"))
     mode = "with_volume" if has_volume else "sketch_only"
+    ts = datetime.now().isoformat()
+    usage_summary = format_usage_summary(token_records) if token_records else None
 
     results_data = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": ts,
         "total_elapsed_s": total_elapsed,
         "model": "gemini_flash_image_edit",
         "mode": mode,
@@ -143,8 +150,7 @@ def save_results(
         result_image.image.save(run_dir / "result.png")
         results_data["result"] = "result.png"
 
-    if token_records:
-        usage_summary = format_usage_summary(token_records)
+    if token_records and usage_summary:
         results_data["token_usage"] = {
             "records": token_records,
             "summary": usage_summary,
@@ -157,7 +163,7 @@ def save_results(
     lines = [
         "Low-Fi to High-Fi Sketch — Gemini",
         "=" * 50,
-        f"Date: {datetime.now().isoformat()}",
+        f"Date: {ts}",
         f"Total time: {total_elapsed:.1f}s",
         f"Model: gemini_flash_image_edit",
         f"Mode: {mode}",
@@ -166,8 +172,7 @@ def save_results(
         for k, v in spec["extra"].items():
             lines.append(f"  {k.capitalize()}: {v}")
 
-    if token_records:
-        usage_summary = format_usage_summary(token_records)
+    if token_records and usage_summary:
         lines.append("")
         lines.append("Token Usage & Pricing")
         lines.append("-" * 40)
