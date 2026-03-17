@@ -221,6 +221,7 @@ def build_sketch_grid(
 _TILE_SIZE = 500
 _LABEL_HEIGHT = 30
 _LABEL_FONT_SIZE = 28
+_TILE_SPACING = 20
 _MAX_GRID_PX = 2048
 
 
@@ -273,13 +274,14 @@ def _build_labeled_tile(
     draw.text((text_x, 2), label, fill=(0, 0, 0), font=font)
 
     # Fit image into tile_w x tile_h box preserving aspect ratio
+    text_gap = 8
     ow, oh = img.size
     scale = min(tile_w / ow, tile_h / oh)
     new_w = round(ow * scale)
     new_h = round(oh * scale)
     resized = img.convert("RGB").resize((new_w, new_h), PILImage.LANCZOS)
     paste_x = (tile_w - new_w) // 2
-    paste_y = label_h + (tile_h - new_h) // 2
+    paste_y = label_h + text_gap + (tile_h - new_h) // 2
     tile.paste(resized, (paste_x, paste_y))
 
     return tile
@@ -317,14 +319,17 @@ def build_material_grid(
     tile_w = tiles[0].width
     tile_h = tiles[0].height
 
-    grid_w = cols * tile_w
-    grid_h = rows * tile_h
+    sp = _TILE_SPACING
+    grid_w = cols * tile_w + (cols + 1) * sp
+    grid_h = rows * tile_h + (rows + 1) * sp
     grid = PILImage.new("RGB", (grid_w, grid_h), (255, 255, 255))
 
     for idx, tile in enumerate(tiles):
         row = idx // cols
         col = idx % cols
-        grid.paste(tile, (col * tile_w, row * tile_h))
+        x = sp + col * (tile_w + sp)
+        y = sp + row * (tile_h + sp)
+        grid.paste(tile, (x, y))
 
     # Pad to square
     gw, gh = grid.size

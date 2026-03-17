@@ -1653,21 +1653,28 @@ def create_app(
 
             NUM_HERO_CANDIDATES = 2
 
-            job_manager.update_progress(job_id, 0.05, "Generating hero candidates...")
+            job_manager.update_progress(job_id, 0.05, "Generating hero candidates concurrently...")
             var_results_dir.mkdir(parents=True, exist_ok=True)
 
             from casadei.loop import LoopResult as _LoopResult
-            candidates: list[HeroCandidate] = []
-            best_score = -1.0
-            best_candidate_idx = 0
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            for run_idx in range(NUM_HERO_CANDIDATES):
-                pct_base = 0.05 + run_idx * (0.85 / NUM_HERO_CANDIDATES)
-                pct_end = 0.05 + (run_idx + 1) * (0.85 / NUM_HERO_CANDIDATES)
-                job_manager.update_progress(
-                    job_id, pct_base,
-                    f"Generating candidate {run_idx + 1}/{NUM_HERO_CANDIDATES}..."
-                )
+            # Track progress across concurrent runs
+            _run_progress: dict[int, float] = {}
+            _progress_lock = threading.Lock()
+
+            def _update_combined_progress():
+                with _progress_lock:
+                    if _run_progress:
+                        avg = sum(_run_progress.values()) / NUM_HERO_CANDIDATES
+                        pct = 0.05 + avg * 0.85
+                    else:
+                        pct = 0.05
+                job_manager.update_progress(job_id, min(pct, 0.89), "Generating candidates...")
+
+            def _run_single_candidate(run_idx: int) -> list[HeroCandidate]:
+                """Run one candidate pipeline and return its HeroCandidate list."""
+                run_candidates: list[HeroCandidate] = []
 
                 vlm_session = VLMSession("gemini_flash_lite")
                 try:
@@ -1682,7 +1689,6 @@ def create_app(
                         "sketch": sketch_media,
                         "image": sketch_media,
                     }
-                    # Add materials grid or reference images to context
                     if grid_image is not None:
                         context["materials_grid"] = ImageMedia(image=grid_image)
                     else:
@@ -1691,16 +1697,14 @@ def create_app(
 
                     # Progress monitor for this run
                     _progress_done = threading.Event()
-                    def _make_monitor(base=pct_base, end=pct_end, done=_progress_done):
+                    def _make_monitor(idx=run_idx, done=_progress_done):
                         def _monitor():
                             step = 0
                             while not done.is_set():
                                 step += 1
-                                pct = min(base + step * 0.08, end - 0.02)
-                                job_manager.update_progress(
-                                    job_id, pct,
-                                    f"Candidate {run_idx + 1}/{NUM_HERO_CANDIDATES} — iteration {step}..."
-                                )
+                                with _progress_lock:
+                                    _run_progress[idx] = min(step * 0.25, 0.95)
+                                _update_combined_progress()
                                 done.wait(timeout=20)
                         return _monitor
 
@@ -1712,6 +1716,9 @@ def create_app(
                     finally:
                         _progress_done.set()
                         monitor.join(timeout=5)
+                        with _progress_lock:
+                            _run_progress[run_idx] = 1.0
+                        _update_combined_progress()
 
                 finally:
                     vlm_session.unload()
@@ -1739,7 +1746,7 @@ def create_app(
 
                         c_fname = f"hero_candidate_{run_idx}_{it.index}.png"
                         it_img.image.save(var_results_dir / c_fname)
-                        candidates.append(HeroCandidate(
+                        run_candidates.append(HeroCandidate(
                             filename=c_fname,
                             iteration=run_idx,
                             accepted=it.accepted,
@@ -1747,27 +1754,44 @@ def create_app(
                             feedback=it.feedback[:200],
                             selected=False,
                         ))
-
-                        if it_score > best_score:
-                            best_score = it_score
-                            best_candidate_idx = len(candidates) - 1
                 else:
                     # Fallback: save just the final image if no loop history
                     run_img = result.get("image")
-                    if run_img is None or not isinstance(run_img, ImageMedia):
-                        continue
-                    c_fname = f"hero_candidate_{run_idx}.png"
-                    run_img.image.save(var_results_dir / c_fname)
-                    candidates.append(HeroCandidate(
-                        filename=c_fname,
-                        iteration=run_idx,
-                        accepted=False,
-                        score=0.0,
-                        feedback="",
-                        selected=False,
-                    ))
-                    if 0.0 > best_score:
-                        best_candidate_idx = len(candidates) - 1
+                    if run_img is not None and isinstance(run_img, ImageMedia):
+                        c_fname = f"hero_candidate_{run_idx}.png"
+                        run_img.image.save(var_results_dir / c_fname)
+                        run_candidates.append(HeroCandidate(
+                            filename=c_fname,
+                            iteration=run_idx,
+                            accepted=False,
+                            score=0.0,
+                            feedback="",
+                            selected=False,
+                        ))
+
+                return run_candidates
+
+            # Run all candidates concurrently
+            candidates: list[HeroCandidate] = []
+            with ThreadPoolExecutor(max_workers=NUM_HERO_CANDIDATES) as executor:
+                futures = {
+                    executor.submit(_run_single_candidate, idx): idx
+                    for idx in range(NUM_HERO_CANDIDATES)
+                }
+                for future in as_completed(futures):
+                    try:
+                        run_candidates = future.result()
+                        candidates.extend(run_candidates)
+                    except Exception as e:
+                        logger.warning(f"Candidate {futures[future]} failed: {e}")
+
+            # Find the best candidate
+            best_score = -1.0
+            best_candidate_idx = 0
+            for i, c in enumerate(candidates):
+                if c.score > best_score:
+                    best_score = c.score
+                    best_candidate_idx = i
 
             if not candidates:
                 job_manager.fail(job_id, "All generation runs produced no output")

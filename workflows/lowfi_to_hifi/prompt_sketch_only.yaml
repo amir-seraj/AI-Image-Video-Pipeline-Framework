@@ -6,6 +6,11 @@ prompt_template: |
   structural element. Any text or annotations in the sketch are notes for the
   designer — ignore them entirely and do not reproduce them in the output.
 
+  Here is a detailed analysis of the sketch's design elements — use this as a
+  checklist to ensure every feature is correctly represented in your output:
+
+  $features
+
   Generate a high-fidelity professional pencil sketch of a single shoe that
   faithfully renders the design.
 

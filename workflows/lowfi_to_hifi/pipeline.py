@@ -11,8 +11,11 @@ from pathlib import Path
 
 import yaml
 
-from casadei import Agent, AgentConfig, AgentStep, ImageMedia, Pipeline
+from casadei import Agent, AgentConfig, AgentStep, ImageMedia, Pipeline, TextMedia
+from casadei.pipeline import CodeStep
 from casadei.providers.gemini_pricing import format_usage_summary
+
+from feature_extraction import extract_features
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -61,11 +64,32 @@ def build_extra_specs_text(extra: dict) -> str:
 # Pipeline construction
 # ---------------------------------------------------------------------------
 
+def _make_feature_extraction_fn(gen_step_ref: list[AgentStep]):
+    """Create the feature extraction code step function.
+
+    The function extracts features and injects them into gen_step's
+    template_kwargs so the image generation prompt includes them.
+    """
+    def extract(context: dict) -> dict:
+        sketch_media = context["sketch"]
+        features_text = extract_features(sketch_media.image)
+        # Inject into the generation step's template kwargs
+        gen_step_ref[0].template_kwargs["features"] = features_text
+        return {"features": TextMedia(text=features_text)}
+    return extract
+
+
 def build_pipeline(
     spec: dict,
     temperature: float = 0.8,
 ) -> tuple[Pipeline, Agent]:
     """Build the lowfi-to-hifi sketch generation pipeline.
+
+    The pipeline has two steps:
+      1. Feature extraction — text-only Gemini call with judge loop to produce
+         a verified description of the sketch's design elements.
+      2. Image generation — Gemini Flash image edit, using the sketch (+ volume)
+         and the extracted features to generate the high-fidelity sketch.
 
     The returned pipeline expects these keys in the run context:
       - 'sketch': ImageMedia (required) — the low-fidelity hand-drawn sketch
@@ -83,6 +107,7 @@ def build_pipeline(
     has_volume = bool(spec.get("volume"))
     prompt_config = load_prompt_config(with_volume=has_volume)
 
+    # Step 2 (built first so step 1 can reference it): Image generation
     agent = Agent(AgentConfig(
         name="gemini_lowfi_to_hifi",
         model="gemini_flash_image_edit",
@@ -98,17 +123,24 @@ def build_pipeline(
 
     extra_specs_text = build_extra_specs_text(spec.get("extra", {}))
 
-    step = AgentStep(
+    gen_step = AgentStep(
         name="generate_hifi_sketch",
         agent=agent,
         input_map=input_map,
         output_map={"image": "image"},
         template_kwargs={
             "extra_specs": extra_specs_text,
+            "features": "",  # placeholder, filled by feature extraction step
         },
     )
 
-    return Pipeline(name="lowfi_to_hifi", steps=[step]), agent
+    # Step 1: Feature extraction (code step) — injects features into gen_step
+    feature_step = CodeStep(
+        name="extract_features",
+        fn=_make_feature_extraction_fn([gen_step]),
+    )
+
+    return Pipeline(name="lowfi_to_hifi", steps=[feature_step, gen_step]), agent
 
 
 # ---------------------------------------------------------------------------

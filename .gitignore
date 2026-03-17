@@ -19,3 +19,4 @@ tests/output/
 
 # Large installer artifacts
 Miniconda*.sh
+data/store.json
